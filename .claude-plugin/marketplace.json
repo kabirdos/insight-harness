@@ -9,8 +9,8 @@
     {
       "name": "insight-harness",
       "source": {
-        "source": "github",
-        "repo": "kabirdos/insight-harness"
+        "source": "url",
+        "url": "https://github.com/kabirdos/insight-harness.git"
       },
       "description": "Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days."
     }
