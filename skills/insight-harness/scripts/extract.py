@@ -234,15 +234,24 @@ def _enforce_showcase_budget(harness_json, max_bytes):
     # (a) skillInventory is empty/missing showcase fields (only non-showcase
     #     payload is over budget), or
     # (b) all showcase fields nulled but rest of harness_json still > cap.
-    # Either way, ship the payload but emit a loud warning so the upload
-    # pipeline can detect and reject it instead of failing mid-POST.
+    # Either way, the local HTML still ships (user wants the report for their
+    # own review), but we set a structured marker so the upload pipeline can
+    # detect and reject it instead of failing mid-POST. The marker makes this
+    # a HARD cap from the upload pipeline's perspective even though the
+    # extractor itself can't shrink non-showcase fields without breaking
+    # other features.
     final = len(json.dumps(harness_json))
     if final > max_bytes:
+        harness_json["_payloadOverBudget"] = {
+            "bytes": final,
+            "cap": max_bytes,
+            "reason": "non-showcase payload exceeds cap; cannot shrink further without dropping non-opt-in features",
+        }
         print(
-            f"  WARNING: harness_json exceeds {max_bytes} byte cap after dropping all "
-            f"showcase fields ({final} bytes). The upload pipeline may reject this "
-            f"report. Cause is non-showcase payload bloat (skill inventory size, "
-            f"workflow data, etc.) — not addressable by --include-skills changes.",
+            f"  HARD CAP EXCEEDED: harness_json is {final} bytes (cap {max_bytes}) after "
+            f"dropping all showcase fields. Set _payloadOverBudget marker on JSON for "
+            f"upload-side detection. Cause: non-showcase payload bloat (skill inventory, "
+            f"workflow data, etc.) — not fixable via --include-skills toggles.",
             file=sys.stderr,
         )
 
@@ -1907,14 +1916,10 @@ def generate_html(data):
         if t not in tool_counts:
             tool_counts[t] = c
 
+    # Privacy: skill_invocations is already filtered against the private/none
+    # deny-set in main() before being placed in jsonl_metadata, so every
+    # consumer (writeup, HTML, JSON, workflowData) sees the filtered counter.
     skill_invocations = jsonl.get("skill_invocations", {})
-    # Privacy: drop invocation counts for skills the author opted out of via
-    # repo: private/none. Without this, the HTML rendering and the workflowData
-    # JSON would still leak those skills' names and call counts. Filtering at
-    # the generate_html() entry point covers every downstream consumer.
-    private_names = getattr(skills, "private_skill_names", set()) or set()
-    if private_names:
-        skill_invocations = {n: c for n, c in skill_invocations.items() if n not in private_names}
     hook_defs = settings.get("hooks", [])
     hook_events = jsonl.get("hook_events", {})
     total_hook_fires = sum(hook_events.values())
@@ -2813,6 +2818,19 @@ def main():
 
     print("Scanning JSONL (field-whitelisted)...", file=sys.stderr)
     jsonl_metadata = extract_jsonl_metadata(cutoff)
+
+    # Privacy: drop call counts for skills marked repo: private/none. Filtering
+    # at the data-source level (jsonl_metadata) — not just inside generate_html
+    # — ensures generate_writeup() and any other downstream consumer also sees
+    # the filtered counter. Without this, the writeup paragraph would still
+    # name and quantify private skills.
+    private_names = getattr(skill_inventory, "private_skill_names", set()) or set()
+    if private_names and "skill_invocations" in jsonl_metadata:
+        jsonl_metadata["skill_invocations"] = {
+            n: c
+            for n, c in jsonl_metadata["skill_invocations"].items()
+            if n not in private_names
+        }
 
     print("Reading permissions...", file=sys.stderr)
     permissions_profile = extract_permissions_profile()
