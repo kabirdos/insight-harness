@@ -34,7 +34,7 @@ HOOKS_DIR = CLAUDE_DIR / "hooks"
 AGENTS_DIR = CLAUDE_DIR / "agents"
 
 DAYS = 30
-VERSION = "2.5.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
+VERSION = "2.6.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
 ENV_ASSIGN = re.compile(r'^([A-Z_][A-Z0-9_]*)=')
 
 
@@ -393,19 +393,25 @@ def extract_skill_inventory(include_showcase=False):
     def _stage(meta, sp, source):
         if not meta:
             return
+        # Privacy: repo: private/none always excludes the skill — regardless
+        # of whether showcase data is being collected. Otherwise passing
+        # --no-include-skills would silently re-expose private skill names
+        # via the runtime call counter, which contradicts the SKILL.md
+        # guarantee that these skills are "skipped entirely".
+        repo = (meta.get("repo") or "").strip().lower()
+        if repo in ("private", "none"):
+            # Track the *skill name* so generate_html can also filter it
+            # out of the runtime-invocations pathway. Plugin skills appear
+            # in invocations as "plugin:<owner>/<repo>:<skill>" — the
+            # SKILL.md frontmatter name often matches just the trailing
+            # segment, so we record both forms.
+            name = meta.get("name") or sp.parent.name
+            private_names.add(name)
+            if source.startswith("plugin:"):
+                private_names.add(f"{source[len('plugin:'):]}:{name}")
+            return
+
         if include_showcase:
-            repo = (meta.get("repo") or "").strip().lower()
-            if repo in ("private", "none"):
-                # Track the *skill name* so generate_html can also filter it
-                # out of the runtime-invocations pathway. Plugin skills appear
-                # in invocations as "plugin:<owner>/<repo>:<skill>" — the
-                # SKILL.md frontmatter name often matches just the trailing
-                # segment, so we record both forms.
-                name = meta.get("name") or sp.parent.name
-                private_names.add(name)
-                if source.startswith("plugin:"):
-                    private_names.add(f"{source[len('plugin:'):]}:{name}")
-                return
             raw_readme = _read_raw_readme(sp)
             pending.append((meta, sp, source, raw_readme))
         else:
@@ -2783,11 +2789,17 @@ def self_update():
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--update":
+    # Accept --update in any argv position, not just argv[1]. Matches the
+    # ergonomics of --include-skills / --no-include-skills being positional-
+    # agnostic.
+    if "--update" in sys.argv[1:]:
         self_update()
         sys.exit(0)
 
-    include_showcase = "--include-skills" in sys.argv[1:]
+    # Showcase data (per-skill README + hero) is default-on as of 2.6.0.
+    # `--include-skills` remains as an explicit no-op for backward compat;
+    # `--no-include-skills` opts out for users who want the smaller payload.
+    include_showcase = "--no-include-skills" not in sys.argv[1:]
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS)
 

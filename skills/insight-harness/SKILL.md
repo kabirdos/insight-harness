@@ -1,5 +1,5 @@
 ---
-version: 2.5.0
+version: 2.6.0
 name: insight-harness
 description: Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days. A superset of /insights — adds token breakdowns, tool usage stats, skill inventory, and more. Upload to insightharness.com to share. Triggers on "insight harness", "harness profile", "my setup", "what skills do I use", "show my harness", or "harness report".
 user-invocable: true
@@ -17,12 +17,14 @@ Runs a Python extraction script that reads harness metadata from:
 
 - `~/.claude/settings.json` (hooks, plugins, permissions)
 - `~/.claude/plugins/installed_plugins.json` (plugin inventory)
-- `~/.claude/skills/` (skill frontmatter — names and allowed-tools only)
+- `~/.claude/skills/` (skill frontmatter for every skill; plus README.md + `assets/hero.{png,jpg}` by default for skills you've marked as shareable — see the "Skill showcase" section below)
 - `~/.claude/usage-data/session-meta/` (pre-computed session stats)
 - `~/.claude/projects/*/*.jsonl` (field-whitelisted: tool names, skill names, hook events, tool transition sequences, workflow phase classifications only)
 - `~/.claude/projects/*/settings.local.json` (approved permissions)
 
-**Privacy guarantee:** The script uses a strict field whitelist. It NEVER reads tool arguments, message text, tool results, file paths, or any project-specific content. Real credentials exist in JSONL files — the script never touches those fields.
+**Privacy guarantee:** The script uses a strict field whitelist. It NEVER reads tool arguments, message text, tool results, file paths inside your projects, or any project-specific content. Real credentials exist in JSONL files — the script never touches those fields.
+
+**Skill showcase data (default-on):** By default, the script also reads each shareable skill's `README.md` and hero image, scrubs PII from the README text (git name/email, OS username paths, GitHub URLs with your username, `@<you>` mentions), and ships the results. Skills with `repo: private` or `repo: none` in their SKILL.md frontmatter are excluded entirely — they never appear in the output, not even in invocation counts. See the "Skipping showcase content" section if you want to opt out of shipping README + hero data.
 
 ## What You Get (vs /insights)
 
@@ -44,37 +46,37 @@ Everything from /insights, plus:
 
 ## How to Run
 
-Run the extraction script and open the result:
-
-```bash
-python3 ~/.claude/skills/insight-harness/scripts/extract.py
-```
-
-The script outputs the HTML file path to stdout. Open it in the browser:
-
-```bash
-open "$(python3 ~/.claude/skills/insight-harness/scripts/extract.py)"
-```
-
-### Including skill READMEs and hero images (`--include-skills`)
-
-Pass `--include-skills` to opt into a richer report that ships each shareable skill's README markdown and `assets/hero.{png,jpg}` image alongside the usual stats. When you upload the report to insightharness.com, those become a per-skill showcase others can browse.
+Run the extraction script with `--include-skills` (the default — ships per-skill README + hero data alongside the usual stats) and open the result:
 
 ```bash
 python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills
 ```
 
-What ships per skill:
+Open in the browser:
+
+```bash
+open "$(python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills)"
+```
+
+### What ships per skill
 
 - README.md (or, if absent, the SKILL.md body) — PII-scrubbed: git name/email, OS username paths (`/Users/<you>`, `/home/<you>`), GitHub URLs containing your username, and `@<you>` mentions are replaced with placeholders.
 - Hero image at `assets/hero.png` or `assets/hero.jpg` — PNG/JPEG only (SVG is rejected because PII inside SVG text/CDATA can't be reliably scrubbed). 300KB hard cap per image, 100KB cap on README, 400KB total per skill.
 
-What does **not** ship:
+### What does not ship
 
 - Skills with `repo: private` or `repo: none` in their SKILL.md frontmatter — these are skipped entirely (not even listed).
 - Anything beyond the 6MB serialized payload budget — low-call skills lose their showcase content first if the budget is tight; their stats still appear.
 
 **Review your hero images before uploading.** The PII scrubber operates on text only — it cannot read pixels. A screenshot showing your username, a path, or any visible identifier will ship as-is. Open `assets/hero.png` for each shareable skill and confirm there's nothing identifying in the image itself.
+
+### Skipping showcase content (`--no-include-skills`)
+
+If you want a smaller report without per-skill READMEs and heroes (original 2.3.0 behavior), pass `--no-include-skills`:
+
+```bash
+python3 ~/.claude/skills/insight-harness/scripts/extract.py --no-include-skills
+```
 
 ## Updating
 
