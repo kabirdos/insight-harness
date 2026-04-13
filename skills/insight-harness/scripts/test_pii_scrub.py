@@ -14,25 +14,46 @@ from __future__ import annotations
 import re
 import sys
 
-from pii_scrub import SanitizeError, _fence_count, _newline_count, detect_pii, scrub
+from pii_scrub import (
+    SanitizeError,
+    _detect_github_owners,
+    _fence_count,
+    _newline_count,
+    detect_pii,
+    scrub,
+)
 
 
 def _fake_rules() -> list[tuple[re.Pattern[str], str]]:
     """Synthetic ruleset that mirrors detect_pii() but uses fixed identifiers.
 
     Order must match detect_pii() so the same precedence is exercised.
+    Includes the first-name + possessive forms and a non-username GitHub
+    owner ("acmecorp"), exercising the behaviors added after the codex review.
     """
     pairs = [
+        # Path replacements
         ("/Users/alice/", "~/"),
         ("/Users/alice", "~"),
         ("/home/alice/", "~/"),
         ("/home/alice", "~"),
+        # GitHub URLs — local username
         ("raw.githubusercontent.com/alice/", "raw.githubusercontent.com/<your-username>/"),
         ("githubusercontent.com/alice/", "githubusercontent.com/<your-username>/"),
         ("github.com/alice/", "github.com/<your-username>/"),
+        # @-mentions
         ("@alice", "@<your-username>"),
+        # GitHub URLs — owners detected from content (org name != local username)
+        ("github.com/acmecorp/", "github.com/<your-username>/"),
+        ("githubusercontent.com/acmecorp/", "githubusercontent.com/<your-username>/"),
+        ("raw.githubusercontent.com/acmecorp/", "raw.githubusercontent.com/<your-username>/"),
+        # Email
         ("alice@example.com", "<your-email>"),
+        # Git name — full first, then possessives, then bare first-name
         ("Alice Wonderland", "<your-name>"),
+        ("Alice's", "<your-name>'s"),
+        ("Alice'", "<your-name>'"),
+        ("Alice", "<your-name>"),
     ]
     return [(re.compile(re.escape(n)), r) for n, r in pairs]
 
@@ -83,6 +104,31 @@ CASES: list[tuple[str, str, str]] = [
         "unrelated github user not replaced",
         "Compare with https://github.com/torvalds/linux",
         "Compare with https://github.com/torvalds/linux",
+    ),
+    (
+        "GitHub owner detected from content (org != local username)",
+        "Repo at https://github.com/acmecorp/widgets",
+        "Repo at https://github.com/<your-username>/widgets",
+    ),
+    (
+        "raw.githubusercontent owner from content",
+        "https://raw.githubusercontent.com/acmecorp/widgets/main/img.png",
+        "https://raw.githubusercontent.com/<your-username>/widgets/main/img.png",
+    ),
+    (
+        "first-name only is replaced",
+        "Hi, this is Alice speaking.",
+        "Hi, this is <your-name> speaking.",
+    ),
+    (
+        "possessive form (Alice's) is replaced",
+        "Read Alice's setup notes.",
+        "Read <your-name>'s setup notes.",
+    ),
+    (
+        "trailing apostrophe (Alice') is replaced",
+        "Borrow Alice' tools.",
+        "Borrow <your-name>' tools.",
     ),
     (
         "fenced code block content also scrubbed (text replacement is greedy)",
@@ -143,15 +189,41 @@ def test_detect_pii_with_no_git_config():
     return 0
 
 
+def test_detect_github_owners():
+    """_detect_github_owners must find distinct owners from github URLs."""
+    text = (
+        "https://github.com/acmecorp/widgets and "
+        "https://githubusercontent.com/acmecorp/widgets/raw and "
+        "https://github.com/acmecorp/other and "
+        "https://github.com/torvalds/linux and "
+        "https://github.com/<your-username>/skip-this"
+    )
+    owners = _detect_github_owners(text)
+    if "acmecorp" not in owners:
+        print(f"FAIL: acmecorp missing from {owners}", file=sys.stderr)
+        return 1
+    if "torvalds" not in owners:
+        print(f"FAIL: torvalds missing from {owners}", file=sys.stderr)
+        return 1
+    if "<your-username>" in owners:
+        print(f"FAIL: placeholder leaked into {owners}", file=sys.stderr)
+        return 1
+    if owners.count("acmecorp") != 1:
+        print(f"FAIL: acmecorp duplicated in {owners}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main():
     rules = _fake_rules()
     fixture_failures = run_cases(rules)
     invariant_failures = test_invariant_failure_raises()
     detect_failures = test_detect_pii_with_no_git_config()
+    owner_failures = test_detect_github_owners()
 
-    total = fixture_failures + invariant_failures + detect_failures
+    total = fixture_failures + invariant_failures + detect_failures + owner_failures
     if total == 0:
-        print(f"OK ({len(CASES)} fixture cases + 2 meta-tests)")
+        print(f"OK ({len(CASES)} fixture cases + 3 meta-tests)")
         return 0
     print(f"FAILED: {total} failure(s)", file=sys.stderr)
     return 1

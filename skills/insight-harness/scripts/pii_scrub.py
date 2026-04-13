@@ -51,12 +51,19 @@ def _local_username() -> str:
     return ""
 
 
-def detect_pii() -> list[tuple[re.Pattern[str], str]]:
+def detect_pii(content_for_owner_scan: str = "") -> list[tuple[re.Pattern[str], str]]:
     """Build the ordered list of (compiled_regex, replacement) pairs.
 
     Order matters: longer/more-specific patterns must run before shorter
     overlapping ones (e.g. `/Users/<u>/` before `/Users/<u>` so we don't
     leave a stray slash).
+
+    Pass `content_for_owner_scan` (typically the concatenated README text
+    across all skills) to enable GitHub-owner detection — any owner that
+    appears in `github.com/<owner>/` URLs gets a replacement, even when the
+    owner doesn't match the local OS username (common case: local user
+    `craig` but repos under org `kabirdos`). Without this, owner-bearing
+    URLs leak.
     """
     rules: list[tuple[str, str]] = []
 
@@ -77,12 +84,30 @@ def detect_pii() -> list[tuple[re.Pattern[str], str]]:
         # @-mentions tied to local username
         rules.append((f"@{username}", "@<your-username>"))
 
+    # GitHub owner scan — pulls owners from the actual content rather than
+    # only matching the OS username. Mirrors detectGithubOwners() in the JS
+    # reference. Skips owners we've already scrubbed via the username rules.
+    if content_for_owner_scan:
+        for owner in _detect_github_owners(content_for_owner_scan):
+            if owner == username:
+                continue
+            rules.append((f"github.com/{owner}/", "github.com/<your-username>/"))
+            rules.append((f"githubusercontent.com/{owner}/", "githubusercontent.com/<your-username>/"))
+            rules.append((f"raw.githubusercontent.com/{owner}/", "raw.githubusercontent.com/<your-username>/"))
+
     if git_email:
         rules.append((git_email, "<your-email>"))
 
     if git_name:
-        # Replace full name first, then bare first-name
+        # Full name first, then first-name + possessive forms (matches JS
+        # reference). Order matters: full name, then "First's", "First'",
+        # then bare "First" — so possessives don't get partially eaten.
         rules.append((git_name, "<your-name>"))
+        first = git_name.split()[0] if git_name.split() else ""
+        if first and len(first) > 2:
+            rules.append((f"{first}'s", "<your-name>'s"))
+            rules.append((f"{first}'", "<your-name>'"))
+            rules.append((first, "<your-name>"))
 
     # Compile and dedupe (preserve first occurrence so order is stable)
     seen: set[str] = set()
@@ -93,6 +118,30 @@ def detect_pii() -> list[tuple[re.Pattern[str], str]]:
         seen.add(needle)
         compiled.append((re.compile(re.escape(needle)), repl))
     return compiled
+
+
+_GITHUB_OWNER_RE = re.compile(
+    r"github(?:usercontent)?\.com/([a-zA-Z0-9][a-zA-Z0-9-]{0,38})/"
+)
+
+
+def _detect_github_owners(text: str) -> list[str]:
+    """Return distinct GitHub owners that appear in github.com/<owner>/ URLs.
+
+    Mirrors detectGithubOwners() in skill-showcase/scripts/build-showcase.js.
+    Skips the placeholder we use for replacement so re-scrubbed text is a no-op.
+    """
+    owners: list[str] = []
+    seen: set[str] = set()
+    for match in _GITHUB_OWNER_RE.finditer(text):
+        owner = match.group(1)
+        if owner == "<your-username>":
+            continue
+        if owner in seen:
+            continue
+        seen.add(owner)
+        owners.append(owner)
+    return owners
 
 
 _FENCE_RE = re.compile(r"^```", re.MULTILINE)

@@ -197,36 +197,54 @@ def _enforce_showcase_budget(harness_json, max_bytes):
     JSON past max_bytes, those fields are nulled (keeping name/calls/source/
     description/category) and a stderr warning names the skill and the running
     byte counter. Mutates harness_json in place.
+
+    If the non-showcase payload alone exceeds max_bytes, this function emits a
+    loud warning rather than silently shipping an oversized payload — the
+    upload pipeline can catch it on the receiving end via the same byte check.
     """
     skills = harness_json.get("skillInventory")
-    if not skills:
+
+    initial = len(json.dumps(harness_json))
+    if initial <= max_bytes:
         return
 
-    # Quick exit if the whole payload already fits — common case
-    if len(json.dumps(harness_json)) <= max_bytes:
-        return
-
-    # Strategy: walk in REVERSE calls order (lowest-call first) and null
-    # showcase fields until we fit. The list is already sorted desc by calls
-    # in generate_html(), so iterate from the end.
-    for entry in reversed(skills):
-        if "readme_markdown" not in entry and "hero_base64" not in entry:
-            continue
-        had_content = bool(entry.get("readme_markdown") or entry.get("hero_base64"))
-        if not had_content:
-            continue
-        entry["readme_markdown"] = None
-        entry["hero_base64"] = None
-        entry["hero_mime_type"] = None
-        if had_content:
+    if skills:
+        # Strategy: walk in REVERSE calls order (lowest-call first) and null
+        # showcase fields until we fit. The list is already sorted desc by calls
+        # in generate_html(), so iterate from the end.
+        for entry in reversed(skills):
+            if "readme_markdown" not in entry and "hero_base64" not in entry:
+                continue
+            had_content = bool(entry.get("readme_markdown") or entry.get("hero_base64"))
+            if not had_content:
+                continue
+            entry["readme_markdown"] = None
+            entry["hero_base64"] = None
+            entry["hero_mime_type"] = None
             running = len(json.dumps(harness_json))
             print(
                 f"  showcase budget cap: dropped showcase fields for {entry.get('name')!r} "
                 f"(serialized total now {running} bytes, cap {max_bytes})",
                 file=sys.stderr,
             )
-        if len(json.dumps(harness_json)) <= max_bytes:
-            return
+            if running <= max_bytes:
+                return
+
+    # Fell out of the loop without converging. Could happen when:
+    # (a) skillInventory is empty/missing showcase fields (only non-showcase
+    #     payload is over budget), or
+    # (b) all showcase fields nulled but rest of harness_json still > cap.
+    # Either way, ship the payload but emit a loud warning so the upload
+    # pipeline can detect and reject it instead of failing mid-POST.
+    final = len(json.dumps(harness_json))
+    if final > max_bytes:
+        print(
+            f"  WARNING: harness_json exceeds {max_bytes} byte cap after dropping all "
+            f"showcase fields ({final} bytes). The upload pipeline may reject this "
+            f"report. Cause is non-showcase payload bloat (skill inventory size, "
+            f"workflow data, etc.) — not addressable by --include-skills changes.",
+            file=sys.stderr,
+        )
 
 
 def _read_hero_image(assets_dir):
@@ -287,22 +305,28 @@ def _truncate_to_bytes(text, limit):
     return head.decode("utf-8", errors="ignore") + TRUNCATION_MARKER
 
 
-def _collect_showcase(skill_md_path, scrub_rules):
-    """Read README + hero for one skill, scrub PII, enforce per-item caps.
-
-    Returns dict with readme_markdown, hero_base64, hero_mime_type. Any field
-    that couldn't be loaded comes back as None. The 6MB global cap is NOT
-    enforced here — that runs once at JSON assembly time in generate_html().
-    """
+def _read_raw_readme(skill_md_path):
+    """First-pass helper: read raw (unscrubbed) README content for a skill."""
     skill_dir = skill_md_path.parent
     readme_path = skill_dir / "README.md"
     if readme_path.is_file():
         try:
-            raw_readme = readme_path.read_text(encoding="utf-8", errors="replace")
+            return readme_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            raw_readme = ""
-    else:
-        raw_readme = _skill_md_body(skill_md_path)
+            return ""
+    return _skill_md_body(skill_md_path)
+
+
+def _finalize_showcase(raw_readme, skill_md_path, scrub_rules):
+    """Second-pass helper: scrub PII + read hero + apply per-item caps.
+
+    Splitting from _read_raw_readme lets extract_skill_inventory() do a
+    full pre-scan of all READMEs first to detect GitHub owners (e.g. orgs
+    that don't match the local OS username), then build owner-aware scrub
+    rules once and apply them everywhere. Without this two-pass approach
+    the scrubber leaks any owner the user doesn't share a name with.
+    """
+    skill_dir = skill_md_path.parent
 
     readme_md = ""
     if raw_readme:
@@ -335,44 +359,98 @@ def _collect_showcase(skill_md_path, scrub_rules):
 
 
 def extract_skill_inventory(include_showcase=False):
-    scrub_rules = detect_pii() if include_showcase else None
-    skills = []
+    """Walk skill directories and return inventory list.
 
-    def _process(meta, sp, source):
+    When include_showcase=True, performs a two-pass collection:
+      1. Pre-scan: read all candidate READMEs into memory
+      2. Build owner-aware scrub rules from concatenated content
+      3. Finalize: scrub + read heroes + cap
+
+    Also tracks a private_skills set (skill names with repo: private/none)
+    so generate_html() can filter them out of the runtime-invocations
+    pathway too — without this filter, a private skill that was actually
+    invoked still leaks via the call counter.
+    """
+    skills = []
+    # Private/none skills must also be excluded from the runtime-call inventory
+    # in generate_html. We collect names here and stash them on the returned
+    # list via a sentinel attribute so the caller can access it without
+    # changing the function's primary return type.
+    private_names = set()
+
+    # Stage 1: collect skill metadata + raw READMEs (without scrubbing yet)
+    pending = []  # list of (meta, sp, source, raw_readme)
+
+    def _stage(meta, sp, source):
         if not meta:
             return
         if include_showcase:
             repo = (meta.get("repo") or "").strip().lower()
             if repo in ("private", "none"):
-                return  # skip entirely — author opted out
-            showcase = _collect_showcase(sp, scrub_rules)
-            meta["readme_markdown"] = showcase["readme_markdown"]
-            meta["hero_base64"] = showcase["hero_base64"]
-            meta["hero_mime_type"] = showcase["hero_mime_type"]
-            meta["category"] = meta.get("category") or None
-        meta["source"] = source
-        skills.append(meta)
+                # Track the *skill name* so generate_html can also filter it
+                # out of the runtime-invocations pathway. Plugin skills appear
+                # in invocations as "plugin:<owner>/<repo>:<skill>" — the
+                # SKILL.md frontmatter name often matches just the trailing
+                # segment, so we record both forms.
+                name = meta.get("name") or sp.parent.name
+                private_names.add(name)
+                if source.startswith("plugin:"):
+                    private_names.add(f"{source[len('plugin:'):]}:{name}")
+                return
+            raw_readme = _read_raw_readme(sp)
+            pending.append((meta, sp, source, raw_readme))
+        else:
+            meta["source"] = source
+            skills.append(meta)
 
     for sp in SKILLS_DIR.glob("*/SKILL.md"):
-        _process(parse_skill_frontmatter(sp), sp, "user")
+        _stage(parse_skill_frontmatter(sp), sp, "user")
     for sp in SKILLS_DIR.glob("*.md"):
         if sp.name != "SKILL.md":
-            _process(parse_skill_frontmatter(sp), sp, "user")
+            _stage(parse_skill_frontmatter(sp), sp, "user")
     for sp in PLUGINS_DIR.glob("cache/*/*/*/skills/*/SKILL.md"):
         m = parse_skill_frontmatter(sp)
         if m:
             parts = sp.parts
             ci = parts.index("cache")
-            _process(m, sp, f"plugin:{parts[ci+1]}/{parts[ci+2]}")
+            _stage(m, sp, f"plugin:{parts[ci+1]}/{parts[ci+2]}")
     for cp in PLUGINS_DIR.glob("cache/*/*/*/commands/*.md"):
         m = parse_skill_frontmatter(cp)
         if m:
             parts = cp.parts
             ci = parts.index("cache")
-            _process(m, cp, f"plugin:{parts[ci+1]}/{parts[ci+2]}")
+            _stage(m, cp, f"plugin:{parts[ci+1]}/{parts[ci+2]}")
     for cp in COMMANDS_DIR.glob("*.md"):
         skills.append({"name": cp.stem, "description": "", "allowed_tools": [], "user_invocable": True, "source": "command"})
-    return skills
+
+    # Stage 2 + 3: build owner-aware rules from full corpus, then finalize
+    if include_showcase:
+        combined = "\n".join(raw or "" for _, _, _, raw in pending)
+        scrub_rules = detect_pii(content_for_owner_scan=combined)
+        for meta, sp, source, raw_readme in pending:
+            showcase = _finalize_showcase(raw_readme, sp, scrub_rules)
+            meta["readme_markdown"] = showcase["readme_markdown"]
+            meta["hero_base64"] = showcase["hero_base64"]
+            meta["hero_mime_type"] = showcase["hero_mime_type"]
+            meta["category"] = meta.get("category") or None
+            meta["source"] = source
+            skills.append(meta)
+
+    # Attach the deny-set to the list via a sentinel attribute. This is
+    # simpler than changing the return type and rippling through callers.
+    skills_with_deny = _SkillInventoryList(skills)
+    skills_with_deny.private_skill_names = private_names
+    return skills_with_deny
+
+
+class _SkillInventoryList(list):
+    """Plain list subclass that carries a private_skill_names attribute.
+
+    Used so callers that treat the return value as `list` keep working,
+    while `generate_html` can read the deny-set without us changing the
+    public signature of `extract_skill_inventory`.
+    """
+    private_skill_names: set
 
 
 def parse_skill_frontmatter(path):
@@ -1830,6 +1908,13 @@ def generate_html(data):
             tool_counts[t] = c
 
     skill_invocations = jsonl.get("skill_invocations", {})
+    # Privacy: drop invocation counts for skills the author opted out of via
+    # repo: private/none. Without this, the HTML rendering and the workflowData
+    # JSON would still leak those skills' names and call counts. Filtering at
+    # the generate_html() entry point covers every downstream consumer.
+    private_names = getattr(skills, "private_skill_names", set()) or set()
+    if private_names:
+        skill_invocations = {n: c for n, c in skill_invocations.items() if n not in private_names}
     hook_defs = settings.get("hooks", [])
     hook_events = jsonl.get("hook_events", {})
     total_hook_fires = sum(hook_events.values())
@@ -2051,7 +2136,9 @@ def generate_html(data):
         {"name": "Compactions", "active": jsonl.get("compaction_events", 0) > 0, "value": str(jsonl.get("compaction_events", 0))},
     ]
 
-    # Skill inventory array
+    # Skill inventory array. skill_invocations is already filtered against the
+    # private/none deny-set at the top of generate_html, so iterating it here
+    # is enough to keep private skills out of the public payload.
     _skill_inventory_json = []
     for n, c in sorted(skill_invocations.items(), key=lambda x: x[1], reverse=True)[:20]:
         sm = skill_meta.get(n, {})
@@ -2065,7 +2152,7 @@ def generate_html(data):
             "description": sm.get("description", ""),
         }
         # Showcase fields — present only when extract was run with --include-skills
-        # AND the skill survived the repo: private/none filter. _process() in
+        # AND the skill survived the repo: private/none filter. _stage() in
         # extract_skill_inventory always sets all four when include_showcase=True,
         # so presence of any one signals the rest are intentional (possibly None).
         if "readme_markdown" in sm:
