@@ -17,12 +17,14 @@ Runs a Python extraction script that reads harness metadata from:
 
 - `~/.claude/settings.json` (hooks, plugins, permissions)
 - `~/.claude/plugins/installed_plugins.json` (plugin inventory)
-- `~/.claude/skills/` (skill frontmatter — names and allowed-tools only)
+- `~/.claude/skills/` (skill frontmatter for every skill; plus README.md + `assets/hero.{png,jpg}` by default for skills you've marked as shareable — see the "Skill showcase" section below)
 - `~/.claude/usage-data/session-meta/` (pre-computed session stats)
 - `~/.claude/projects/*/*.jsonl` (field-whitelisted: tool names, skill names, hook events, tool transition sequences, workflow phase classifications only)
 - `~/.claude/projects/*/settings.local.json` (approved permissions)
 
-**Privacy guarantee:** The script uses a strict field whitelist. It NEVER reads tool arguments, message text, tool results, file paths, or any project-specific content. Real credentials exist in JSONL files — the script never touches those fields.
+**Privacy guarantee:** The script uses a strict field whitelist. It NEVER reads tool arguments, message text, tool results, file paths inside your projects, or any project-specific content. Real credentials exist in JSONL files — the script never touches those fields.
+
+**Skill showcase data (default-on):** By default, the script also reads each shareable skill's `README.md` and hero image, scrubs PII from the README text (git name/email, OS username paths, GitHub URLs with your username, `@<you>` mentions), and ships the results. Skills with `repo: private` or `repo: none` in their SKILL.md frontmatter are excluded entirely — they never appear in the output, not even in invocation counts. See the "Skipping showcase content" section if you want to opt out of shipping README + hero data.
 
 ## What You Get (vs /insights)
 
