@@ -16,8 +16,10 @@ It's a **superset of `/insights`** — everything `/insights` provides, plus tok
 
 ## Install (plugin marketplace)
 
-```bash
-claude plugin marketplace add kabirdos/insight-harness
+Run these two commands inside Claude Code:
+
+```
+/plugin marketplace add kabirdos/insight-harness
 /plugin install insight-harness@kabirdos-insight-harness
 ```
 
