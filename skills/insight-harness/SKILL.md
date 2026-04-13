@@ -1,5 +1,5 @@
 ---
-version: 2.3.0
+version: 2.4.0
 name: insight-harness
 description: Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days. A superset of /insights — adds token breakdowns, tool usage stats, skill inventory, and more. Upload to insightharness.com to share. Triggers on "insight harness", "harness profile", "my setup", "what skills do I use", "show my harness", or "harness report".
 user-invocable: true
@@ -55,6 +55,26 @@ The script outputs the HTML file path to stdout. Open it in the browser:
 ```bash
 open "$(python3 ~/.claude/skills/insight-harness/scripts/extract.py)"
 ```
+
+### Including skill READMEs and hero images (`--include-skills`)
+
+Pass `--include-skills` to opt into a richer report that ships each shareable skill's README markdown and `assets/hero.{png,jpg}` image alongside the usual stats. When you upload the report to insightharness.com, those become a per-skill showcase others can browse.
+
+```bash
+python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills
+```
+
+What ships per skill:
+
+- README.md (or, if absent, the SKILL.md body) — PII-scrubbed: git name/email, OS username paths (`/Users/<you>`, `/home/<you>`), GitHub URLs containing your username, and `@<you>` mentions are replaced with placeholders.
+- Hero image at `assets/hero.png` or `assets/hero.jpg` — PNG/JPEG only (SVG is rejected because PII inside SVG text/CDATA can't be reliably scrubbed). 300KB hard cap per image, 100KB cap on README, 400KB total per skill.
+
+What does **not** ship:
+
+- Skills with `repo: private` or `repo: none` in their SKILL.md frontmatter — these are skipped entirely (not even listed).
+- Anything beyond the 6MB serialized payload budget — low-call skills lose their showcase content first if the budget is tight; their stats still appear.
+
+**Review your hero images before uploading.** The PII scrubber operates on text only — it cannot read pixels. A screenshot showing your username, a path, or any visible identifier will ship as-is. Open `assets/hero.png` for each shareable skill and confirm there's nothing identifying in the image itself.
 
 ## Updating
 
