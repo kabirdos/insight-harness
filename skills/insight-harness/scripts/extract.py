@@ -34,7 +34,7 @@ HOOKS_DIR = CLAUDE_DIR / "hooks"
 AGENTS_DIR = CLAUDE_DIR / "agents"
 
 DAYS = 30
-VERSION = "2.5.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
+VERSION = "2.6.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
 ENV_ASSIGN = re.compile(r'^([A-Z_][A-Z0-9_]*)=')
 
 
@@ -2787,7 +2787,10 @@ def main():
         self_update()
         sys.exit(0)
 
-    include_showcase = "--include-skills" in sys.argv[1:]
+    # Showcase data (per-skill README + hero) is default-on as of 2.6.0.
+    # `--include-skills` remains as an explicit no-op for backward compat;
+    # `--no-include-skills` opts out for users who want the smaller payload.
+    include_showcase = "--no-include-skills" not in sys.argv[1:]
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS)
 
