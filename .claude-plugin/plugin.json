@@ -1,6 +1,6 @@
 {
   "name": "insight-harness",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days.",
   "author": {
     "name": "Craig Dos Santos"
@@ -8,5 +8,11 @@
   "homepage": "https://github.com/kabirdos/insight-harness",
   "repository": "https://github.com/kabirdos/insight-harness",
   "license": "MIT",
-  "keywords": ["claude-code", "skill", "insights", "harness", "analytics"]
+  "keywords": [
+    "claude-code",
+    "skill",
+    "insights",
+    "harness",
+    "analytics"
+  ]
 }
