@@ -11,6 +11,7 @@ For Bash commands, ONLY the first token (command name) is extracted using a safe
 4-step normalizer that strips env var assignments and comment lines.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -20,6 +21,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 from pathlib import Path
+
+from pii_scrub import SanitizeError, detect_pii, scrub
 
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
@@ -31,7 +34,7 @@ HOOKS_DIR = CLAUDE_DIR / "hooks"
 AGENTS_DIR = CLAUDE_DIR / "agents"
 
 DAYS = 30
-VERSION = "2.3.0"  # Keep in sync with SKILL.md frontmatter
+VERSION = "2.4.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
 ENV_ASSIGN = re.compile(r'^([A-Z_][A-Z0-9_]*)=')
 
 
@@ -169,33 +172,204 @@ def extract_installed_plugins():
     return plugins
 
 
-def extract_skill_inventory():
+# ── Showcase data collection (--include-skills) ────────────────────────────
+
+# Image format magic bytes — extension is not trusted
+_PNG_SIG = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIG = b"\xff\xd8\xff"
+
+# Per-skill payload caps (post-PII-scrub). See plan
+# docs/plans/2026-04-12-002 → "Hard payload caps".
+MAX_HERO_BYTES = 300 * 1024
+MAX_README_BYTES = 100 * 1024
+MAX_PER_SKILL_BYTES = 400 * 1024
+TRUNCATION_MARKER = "\n\n<!-- truncated -->\n"
+
+# Global serialized harness_json budget — enforced in generate_html(), not here.
+MAX_HARNESS_JSON_BYTES = 6 * 1024 * 1024
+
+
+def _enforce_showcase_budget(harness_json, max_bytes):
+    """Drop showcase fields from low-priority skills until serialized JSON fits.
+
+    Iterates skillInventory in calls-desc order. For each skill, measures the
+    serialized total; if adding that skill's showcase fields would push the
+    JSON past max_bytes, those fields are nulled (keeping name/calls/source/
+    description/category) and a stderr warning names the skill and the running
+    byte counter. Mutates harness_json in place.
+    """
+    skills = harness_json.get("skillInventory")
+    if not skills:
+        return
+
+    # Quick exit if the whole payload already fits — common case
+    if len(json.dumps(harness_json)) <= max_bytes:
+        return
+
+    # Strategy: walk in REVERSE calls order (lowest-call first) and null
+    # showcase fields until we fit. The list is already sorted desc by calls
+    # in generate_html(), so iterate from the end.
+    for entry in reversed(skills):
+        if "readme_markdown" not in entry and "hero_base64" not in entry:
+            continue
+        had_content = bool(entry.get("readme_markdown") or entry.get("hero_base64"))
+        if not had_content:
+            continue
+        entry["readme_markdown"] = None
+        entry["hero_base64"] = None
+        entry["hero_mime_type"] = None
+        if had_content:
+            running = len(json.dumps(harness_json))
+            print(
+                f"  showcase budget cap: dropped showcase fields for {entry.get('name')!r} "
+                f"(serialized total now {running} bytes, cap {max_bytes})",
+                file=sys.stderr,
+            )
+        if len(json.dumps(harness_json)) <= max_bytes:
+            return
+
+
+def _read_hero_image(assets_dir):
+    """Return (raw_bytes, mime_type) for assets/hero.{png,jpg,jpeg} or (None, None).
+
+    Rejects oversized files and any whose magic bytes don't match png/jpeg.
+    Logs the reason to stderr so users know why a hero didn't ship.
+    """
+    if not assets_dir.is_dir():
+        return None, None
+    for name in ("hero.png", "hero.jpg", "hero.jpeg"):
+        p = assets_dir / name
+        if not p.is_file():
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size > MAX_HERO_BYTES:
+            print(f"  hero too large ({size} > {MAX_HERO_BYTES} bytes): {p}", file=sys.stderr)
+            return None, None
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        if data.startswith(_PNG_SIG):
+            return data, "image/png"
+        if data.startswith(_JPEG_SIG):
+            return data, "image/jpeg"
+        print(f"  hero rejected (magic-byte mismatch): {p}", file=sys.stderr)
+        return None, None
+    return None, None
+
+
+def _skill_md_body(skill_md_path):
+    """Return the markdown body of a SKILL.md (everything after closing frontmatter)."""
+    try:
+        text = skill_md_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if not text.startswith("---"):
+        return text
+    end = text.find("---", 3)
+    if end == -1:
+        return ""
+    return text[end + 3:].lstrip("\n")
+
+
+def _truncate_to_bytes(text, limit):
+    """Truncate text to at most `limit` UTF-8 bytes, then append the marker."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    head = encoded[:limit]
+    # Back off to a valid UTF-8 char boundary
+    while head and (head[-1] & 0xC0) == 0x80:
+        head = head[:-1]
+    return head.decode("utf-8", errors="ignore") + TRUNCATION_MARKER
+
+
+def _collect_showcase(skill_md_path, scrub_rules):
+    """Read README + hero for one skill, scrub PII, enforce per-item caps.
+
+    Returns dict with readme_markdown, hero_base64, hero_mime_type. Any field
+    that couldn't be loaded comes back as None. The 6MB global cap is NOT
+    enforced here — that runs once at JSON assembly time in generate_html().
+    """
+    skill_dir = skill_md_path.parent
+    readme_path = skill_dir / "README.md"
+    if readme_path.is_file():
+        try:
+            raw_readme = readme_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raw_readme = ""
+    else:
+        raw_readme = _skill_md_body(skill_md_path)
+
+    readme_md = ""
+    if raw_readme:
+        try:
+            scrubbed = scrub(raw_readme, rules=scrub_rules, context=str(skill_md_path))
+        except SanitizeError as e:
+            print(f"  PII scrub failed for {skill_md_path}: {e}", file=sys.stderr)
+            scrubbed = ""
+        readme_md = _truncate_to_bytes(scrubbed, MAX_README_BYTES)
+
+    hero_bytes, mime = _read_hero_image(skill_dir / "assets")
+    hero_b64 = base64.b64encode(hero_bytes).decode("ascii") if hero_bytes else None
+
+    # Per-skill 400KB cap: drop hero first, then truncate README harder
+    readme_size = len(readme_md.encode("utf-8"))
+    hero_size = len(hero_b64) if hero_b64 else 0
+    if readme_size + hero_size > MAX_PER_SKILL_BYTES:
+        if hero_b64 and readme_size <= MAX_PER_SKILL_BYTES:
+            print(f"  per-skill cap exceeded; dropping hero for {skill_md_path}", file=sys.stderr)
+            hero_b64, mime = None, None
+        else:
+            readme_md = _truncate_to_bytes(readme_md, MAX_PER_SKILL_BYTES)
+            hero_b64, mime = None, None
+
+    return {
+        "readme_markdown": readme_md or None,
+        "hero_base64": hero_b64,
+        "hero_mime_type": mime,
+    }
+
+
+def extract_skill_inventory(include_showcase=False):
+    scrub_rules = detect_pii() if include_showcase else None
     skills = []
+
+    def _process(meta, sp, source):
+        if not meta:
+            return
+        if include_showcase:
+            repo = (meta.get("repo") or "").strip().lower()
+            if repo in ("private", "none"):
+                return  # skip entirely — author opted out
+            showcase = _collect_showcase(sp, scrub_rules)
+            meta["readme_markdown"] = showcase["readme_markdown"]
+            meta["hero_base64"] = showcase["hero_base64"]
+            meta["hero_mime_type"] = showcase["hero_mime_type"]
+            meta["category"] = meta.get("category") or None
+        meta["source"] = source
+        skills.append(meta)
+
     for sp in SKILLS_DIR.glob("*/SKILL.md"):
-        m = parse_skill_frontmatter(sp)
-        if m:
-            m["source"] = "user"
-            skills.append(m)
+        _process(parse_skill_frontmatter(sp), sp, "user")
     for sp in SKILLS_DIR.glob("*.md"):
         if sp.name != "SKILL.md":
-            m = parse_skill_frontmatter(sp)
-            if m:
-                m["source"] = "user"
-                skills.append(m)
+            _process(parse_skill_frontmatter(sp), sp, "user")
     for sp in PLUGINS_DIR.glob("cache/*/*/*/skills/*/SKILL.md"):
         m = parse_skill_frontmatter(sp)
         if m:
             parts = sp.parts
             ci = parts.index("cache")
-            m["source"] = f"plugin:{parts[ci+1]}/{parts[ci+2]}"
-            skills.append(m)
+            _process(m, sp, f"plugin:{parts[ci+1]}/{parts[ci+2]}")
     for cp in PLUGINS_DIR.glob("cache/*/*/*/commands/*.md"):
         m = parse_skill_frontmatter(cp)
         if m:
             parts = cp.parts
             ci = parts.index("cache")
-            m["source"] = f"plugin:{parts[ci+1]}/{parts[ci+2]}"
-            skills.append(m)
+            _process(m, cp, f"plugin:{parts[ci+1]}/{parts[ci+2]}")
     for cp in COMMANDS_DIR.glob("*.md"):
         skills.append({"name": cp.stem, "description": "", "allowed_tools": [], "user_invocable": True, "source": "command"})
     return skills
@@ -220,6 +394,8 @@ def parse_skill_frontmatter(path):
             elif key == "description": meta["description"] = val[:120]
             elif key == "allowed-tools": meta["allowed_tools"] = [t.strip() for t in val.split(",")]
             elif key == "user-invocable": meta["user_invocable"] = val.lower() == "true"
+            elif key == "repo": meta["repo"] = val
+            elif key == "category": meta["category"] = val
     if "name" not in meta:
         meta["name"] = path.stem
     meta.setdefault("description", "")
@@ -1882,12 +2058,22 @@ def generate_html(data):
         src = sm.get("source", "")
         if not src:
             src = "plugin" if ":" in n else "custom"
-        _skill_inventory_json.append({
+        entry = {
             "name": n,
             "calls": c,
             "source": src,
             "description": sm.get("description", ""),
-        })
+        }
+        # Showcase fields — present only when extract was run with --include-skills
+        # AND the skill survived the repo: private/none filter. _process() in
+        # extract_skill_inventory always sets all four when include_showcase=True,
+        # so presence of any one signals the rest are intentional (possibly None).
+        if "readme_markdown" in sm:
+            entry["readme_markdown"] = sm.get("readme_markdown")
+            entry["hero_base64"] = sm.get("hero_base64")
+            entry["hero_mime_type"] = sm.get("hero_mime_type")
+            entry["category"] = sm.get("category")
+        _skill_inventory_json.append(entry)
 
     # Hook definitions array
     _hook_defs_json = [
@@ -2016,6 +2202,12 @@ def generate_html(data):
         "enhancedStats": _enhanced_stats,
         "perModelTokens": stats_cache.get("model_tokens", {}),
     }
+
+    # Global showcase budget — enforced ONCE here at assembly time, not in
+    # extract_skill_inventory(), because the real harness_json is built here
+    # and the budget needs to account for non-showcase fields, JSON escaping,
+    # and the HTML wrapper. See plan docs/plans/2026-04-12-002 → "Storage Decision".
+    _enforce_showcase_budget(harness_json, MAX_HARNESS_JSON_BYTES)
 
     _harness_json_str = json.dumps(harness_json)
     # Mandatory: escape </script> to prevent breaking the script tag
@@ -2503,6 +2695,8 @@ def main():
         self_update()
         sys.exit(0)
 
+    include_showcase = "--include-skills" in sys.argv[1:]
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS)
 
     print("Extracting settings...", file=sys.stderr)
@@ -2511,8 +2705,11 @@ def main():
     print("Reading plugins...", file=sys.stderr)
     plugins = extract_installed_plugins()
 
-    print("Scanning skills...", file=sys.stderr)
-    skill_inventory = extract_skill_inventory()
+    if include_showcase:
+        print("Scanning skills (with showcase content)...", file=sys.stderr)
+    else:
+        print("Scanning skills...", file=sys.stderr)
+    skill_inventory = extract_skill_inventory(include_showcase=include_showcase)
 
     print("Reading hooks...", file=sys.stderr)
     hook_scripts = extract_hook_scripts()
