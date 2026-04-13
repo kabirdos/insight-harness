@@ -1,0 +1,15 @@
+{
+  "name": "kabirdos-insight-harness",
+  "owner": {
+    "name": "Craig Dos Santos",
+    "url": "https://github.com/kabirdos"
+  },
+  "description": "Marketplace for the insight-harness Claude Code skill.",
+  "plugins": [
+    {
+      "name": "insight-harness",
+      "source": ".",
+      "description": "Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days."
+    }
+  ]
+}
