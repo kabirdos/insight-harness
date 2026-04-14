@@ -1944,7 +1944,19 @@ def generate_html(data):
     perm_accum = data.get("perm_accumulation", {})
 
     total_sessions = jsonl.get("sessions_with_data", meta.get("session_count", 0))
-    total_tokens = (jsonl.get("total_input_tokens", 0) + jsonl.get("total_output_tokens", 0)) or meta.get("total_tokens", 0)
+    # Headline "Tokens" = full throughput across all 4 usage categories
+    # (input + output + cache_read + cache_creation). Matches the Claude
+    # Code status bar, ccusage, and Anthropic billing. For cache-heavy
+    # Claude Code workloads cache_read alone is typically 90%+ of real
+    # throughput, so input + output only under-reports by 10-50x. See #6.
+    total_tokens = jsonl.get(
+        "total_throughput_tokens", 0
+    ) or (
+        jsonl.get("total_input_tokens", 0)
+        + jsonl.get("total_output_tokens", 0)
+        + jsonl.get("total_cache_read_tokens", 0)
+        + jsonl.get("total_cache_create_tokens", 0)
+    ) or meta.get("total_tokens", 0)
     lifetime_tokens = stats_cache.get("lifetime_tokens", 0)
     total_hours = meta.get("total_duration_hours", 0)
     avg_duration = meta.get("avg_duration_minutes", 0)
