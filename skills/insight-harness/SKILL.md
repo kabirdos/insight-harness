@@ -67,8 +67,10 @@ The extract walks thousands of JSONL files plus the user's home tree and can tak
 4. Open the report path in the user's browser via a plain (foreground) Bash call:
 
    ```bash
-   open <absolute-path-from-step-3>
+   open "<absolute-path-from-step-3>"
    ```
+
+   Keep the path double-quoted. Some users have spaces in their home directory (e.g. `/Users/Jane Doe/.claude/insight-harness/report.html`), so an unquoted `open` call would split the path across multiple shell arguments and fail to open the report.
 
 This is the only supported invocation pattern for step 1. Do not call the extract as a foreground blocking Bash command — on machines with large JSONL histories or heavy home directories it can exceed the 10-minute Bash ceiling and abort mid-run with no report produced.
 
