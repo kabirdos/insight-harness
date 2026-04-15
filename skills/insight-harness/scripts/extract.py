@@ -3010,11 +3010,19 @@ def main():
     print("Generating HTML...", file=sys.stderr)
     html = generate_html(data)
 
-    # Save alongside /insights report in ~/.claude/usage-data/
-    usage_dir = CLAUDE_DIR / "usage-data"
-    usage_dir.mkdir(parents=True, exist_ok=True)
-    primary_path = usage_dir / "insight-harness.html"
+    # Save to our own folder — ~/.claude/usage-data/ is Claude Code's
+    # namespace for the built-in /insights report; we shouldn't squat there.
+    output_dir = CLAUDE_DIR / "insight-harness"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    primary_path = output_dir / "report.html"
     primary_path.write_text(html)
+
+    # Best-effort cleanup of the old output location from prior versions.
+    stale_path = CLAUDE_DIR / "usage-data" / "insight-harness.html"
+    try:
+        stale_path.unlink()
+    except (FileNotFoundError, OSError):
+        pass
 
     # Also save a dated copy in ~/Documents/Claude Reports/ if it exists
     reports_dir = Path.home() / "Documents" / "Claude Reports"
