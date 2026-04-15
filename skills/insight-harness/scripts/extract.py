@@ -1011,31 +1011,47 @@ def extract_permissions_profile():
     approved_mcp = set()
     bash_patterns = set()
     project_count = 0
-    for sf in Path.home().rglob(".claude/settings.local.json"):
-        # Limit depth to avoid traversing too deep
-        if len(sf.parts) > 10:
-            continue
-        data = safe_json_load(sf)
-        if not data:
-            continue
-        project_count += 1
-        for perm in data.get("permissions", {}).get("allow", []):
-            if isinstance(perm, str):
-                if perm.startswith("Skill("):
-                    approved_skills.add(perm[6:].rstrip(")"))
-                elif perm.startswith("mcp__"):
-                    parts = perm.split("__")
-                    if len(parts) >= 2:
-                        approved_mcp.add(parts[1])
-                elif perm.startswith("Bash("):
-                    p = perm[5:].rstrip(")")
-                    cmd = p.split()[0] if p else p
-                    # Scrub paths — only keep the command basename
-                    if cmd and '/' in cmd:
-                        cmd = os.path.basename(cmd.rstrip('*').rstrip('/')) or cmd
-                    # Skip if it looks like a username or home path fragment
-                    if cmd and not cmd.startswith('.') and cmd.lower() not in ('users',):
-                        bash_patterns.add(cmd)
+    # Walk the home dir manually so we can prune heavy directories that
+    # cannot contain real project settings. Path.home().rglob() recurses
+    # into Library, caches, node_modules, etc., which can take many
+    # minutes on large dev machines (tens of minutes or hang entirely
+    # when OrbStack/FUSE mounts are present).
+    PRUNE_DIRS = {
+        "node_modules", ".git", "Library", ".cache", ".npm", ".Trash",
+        ".rustup", ".cargo", ".bun", ".pnpm-store", ".yarn", ".gem",
+        "OrbStack", ".orbstack", ".docker", "venv", ".venv", ".tox",
+        "__pycache__", ".next", ".turbo", ".vite", "dist", "build",
+        ".gradle", ".m2", ".android", ".cocoapods", "Pods",
+    }
+    home = str(Path.home())
+    for dirpath, dirnames, filenames in os.walk(home, followlinks=False):
+        # Mutate dirnames in place to prune traversal
+        dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
+        if "settings.local.json" in filenames and dirpath.endswith(os.sep + ".claude"):
+            sf = Path(dirpath) / "settings.local.json"
+            if len(sf.parts) > 10:
+                continue
+            data = safe_json_load(sf)
+            if not data:
+                continue
+            project_count += 1
+            for perm in data.get("permissions", {}).get("allow", []):
+                if isinstance(perm, str):
+                    if perm.startswith("Skill("):
+                        approved_skills.add(perm[6:].rstrip(")"))
+                    elif perm.startswith("mcp__"):
+                        parts = perm.split("__")
+                        if len(parts) >= 2:
+                            approved_mcp.add(parts[1])
+                    elif perm.startswith("Bash("):
+                        p = perm[5:].rstrip(")")
+                        cmd = p.split()[0] if p else p
+                        # Scrub paths — only keep the command basename
+                        if cmd and '/' in cmd:
+                            cmd = os.path.basename(cmd.rstrip('*').rstrip('/')) or cmd
+                        # Skip if it looks like a username or home path fragment
+                        if cmd and not cmd.startswith('.') and cmd.lower() not in ('users',):
+                            bash_patterns.add(cmd)
     return {
         "approved_skills": sorted(approved_skills),
         "approved_mcp_servers": sorted(approved_mcp),
