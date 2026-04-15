@@ -1,6 +1,6 @@
 {
   "name": "insight-harness",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days.",
   "author": {
     "name": "Craig Dos Santos"
