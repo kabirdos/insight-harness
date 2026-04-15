@@ -20,6 +20,13 @@ Run an insight-harness report on my setup.
 
 Claude runs the extraction script against `~/.claude/` and opens the generated HTML in your browser. The report lands at `~/.claude/usage-data/insight-harness.html`. The script uses a strict field whitelist — it never reads tool arguments, message text, tool results, or file paths from your session logs.
 
+## What this does and doesn't do
+
+- **One-shot snapshot, not a daemon.** The script runs once, writes a single HTML file, and exits. It does **not** install hooks, background jobs, telemetry, or anything that keeps running after it finishes. Re-run it whenever you want a fresh snapshot; nothing changes in your harness between runs.
+- **Output stays local by default.** The generated HTML lives at `~/.claude/usage-data/insight-harness.html` on your machine. It only reaches [insightharness.com](https://insightharness.com) if you choose to upload it yourself.
+- **PII scrubbing runs on your machine, before anything ships.** Git name/email, OS username paths (`/Users/<you>`, `/home/<you>`), GitHub URLs containing your username, and `@<you>` mentions are replaced with placeholders in the extraction script itself — not on the server. You can open the HTML and inspect every string before uploading.
+- **Shareable content is opt-out at the skill level.** Any skill with `repo: private` or `repo: none` in its SKILL.md frontmatter is excluded entirely — not just the README + hero, but the invocation count itself, so a private skill never appears in the report at all. Skills without that flag ship their README and hero image by default. Pass `--no-include-skills` to strip README + hero data from every skill in a single run. **Review your hero images before uploading** — the scrubber can't read pixels.
+
 ## Install
 
 ```bash
