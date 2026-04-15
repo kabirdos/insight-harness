@@ -46,17 +46,33 @@ Everything from /insights, plus:
 
 ## How to Run
 
-Run the extraction script with `--include-skills` (the default — ships per-skill README + hero data alongside the usual stats) and open the result:
+The extract walks thousands of JSONL files plus the user's home tree and can take anywhere from 30 seconds to several minutes depending on machine size. A blocking foreground Bash call will hit its 10-minute ceiling on heavy setups and abort mid-run with no report produced.
 
-```bash
-python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills
-```
+**Always start the script as a background Bash task.** Do not call it as a foreground blocking Bash command. Do not set a custom `timeout` and hope it fits — background Bash tasks aren't bounded by the 10-minute foreground cap, and the harness will notify you when the script exits on its own.
 
-Open in the browser:
+### Required invocation
 
-```bash
-open "$(python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills)"
-```
+1. Start the extract as a background Bash task. **Redirect combined stdout+stderr to a known log file** so the output survives the background task lifecycle regardless of which Claude Code harness the user is on:
+
+   ```bash
+   python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills > /tmp/insight-harness-extract.log 2>&1
+   ```
+
+   Pass `run_in_background: true` to the Bash tool. `--include-skills` is the default behavior and ships per-skill README + hero data; see "Skipping showcase content" below if you need to opt out.
+
+2. Tell the user the extract is running and that it can take several minutes on a heavy home directory. The harness will send a task-completion notification when the script exits — do not poll or sleep while waiting.
+
+3. Once the task completes, `Read` the log file at `/tmp/insight-harness-extract.log`. The **final line is the absolute path** to the generated HTML report (e.g. `/Users/you/.claude/insight-harness/report.html`). Everything above it is the phase log (`Extracting settings... / Scanning skills... / Reading permissions... / Generating HTML...`) — relay the interesting bits (which phases ran, any warnings) to the user.
+
+4. Open the report path in the user's browser via a plain (foreground) Bash call:
+
+   ```bash
+   open "<absolute-path-from-step-3>"
+   ```
+
+   Keep the path double-quoted. Some users have spaces in their home directory (e.g. `/Users/Jane Doe/.claude/insight-harness/report.html`), so an unquoted `open` call would split the path across multiple shell arguments and fail to open the report.
+
+This is the only supported invocation pattern for step 1. Do not call the extract as a foreground blocking Bash command — on machines with large JSONL histories or heavy home directories it can exceed the 10-minute Bash ceiling and abort mid-run with no report produced.
 
 ### What ships per skill
 
@@ -72,11 +88,13 @@ open "$(python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-sk
 
 ### Skipping showcase content (`--no-include-skills`)
 
-If you want a smaller report without per-skill READMEs and heroes (original 2.3.0 behavior), pass `--no-include-skills`:
+If you want a smaller report without per-skill READMEs and heroes (original 2.3.0 behavior), pass `--no-include-skills`. Same background-Bash invocation pattern as above, just with a different flag:
 
 ```bash
-python3 ~/.claude/skills/insight-harness/scripts/extract.py --no-include-skills
+python3 ~/.claude/skills/insight-harness/scripts/extract.py --no-include-skills > /tmp/insight-harness-extract.log 2>&1
 ```
+
+Still pass `run_in_background: true` and read `/tmp/insight-harness-extract.log` after the task-completion notification fires — do not run this as a foreground blocking Bash call.
 
 ## Updating
 
