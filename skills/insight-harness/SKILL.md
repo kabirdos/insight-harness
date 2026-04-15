@@ -48,29 +48,29 @@ Everything from /insights, plus:
 
 The extract walks thousands of JSONL files plus the user's home tree and can take anywhere from 30 seconds to several minutes depending on machine size. A blocking foreground Bash call will hit its 10-minute ceiling on heavy setups and abort mid-run with no report produced.
 
-**Always run the script in the background and stream progress via Monitor.** Do not call the script as a blocking Bash command. Do not set a custom `timeout` and hope it fits.
+**Always run the script through the Monitor tool.** Do not call it as a blocking Bash command. Do not set a custom Bash `timeout` and hope it fits.
 
 ### Required invocation
 
-1. Start the extract as a background Bash task:
+1. Start the extract via the Monitor tool. Redirect stderr to stdout so the script's phase markers (`Extracting settings... / Reading plugins... / Scanning skills... / Reading hooks... / Reading permissions... / Scanning JSONL... / Generating HTML...`) stream as Monitor events in real time:
+   - `command`: `python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills 2>&1`
+   - `description`: `insight-harness extract progress`
+   - `timeout_ms`: `3600000` (1 hour — Monitor's max; accommodates even very heavy machines)
+   - `persistent`: `false`
 
-   ```bash
-   python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills
-   ```
+   `--include-skills` is the default behavior and ships per-skill README + hero data; see "Skipping showcase content" below if you need to opt out.
 
-   Pass `run_in_background: true` to the Bash tool. `--include-skills` is the default behavior and ships per-skill README + hero data; see "Skipping showcase content" below if you need to opt out.
+2. Relay each phase event to the user as it arrives so they see progress instead of a silent multi-minute hang.
 
-2. Immediately attach the Monitor tool to the returned task id. Every stdout line the script prints (`Extracting settings... / Reading plugins... / Scanning skills... / Reading hooks... / Reading permissions... / Scanning JSONL... / Generating HTML...`) becomes a Monitor event — relay these phases to the user so they see progress instead of a silent hang.
+3. When the script exits cleanly, Monitor stops. The **final Monitor event is the absolute path** to the generated HTML report (e.g. `/Users/you/.claude/insight-harness/report.html`) — that path is `extract.py`'s last stdout line.
 
-3. When the task completes, the script's **final stdout line is the absolute path** to the generated HTML report (e.g. `/Users/you/.claude/insight-harness/report.html`).
-
-4. Open that path in the user's browser:
+4. Open that path in the user's browser via a plain Bash call:
 
    ```bash
    open <absolute-path-from-step-3>
    ```
 
-This is the only supported invocation pattern. Any foreground-blocking call, or anything that swallows the script's stdout, regresses users who have large session histories or heavy home directories.
+This is the only supported invocation pattern. Do not start the script via `Bash` with `run_in_background`, and do not call it as a foreground blocking Bash command — both paths regress users who have large session histories or heavy home directories.
 
 ### What ships per skill
 
