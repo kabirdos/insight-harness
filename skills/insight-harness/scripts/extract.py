@@ -1600,6 +1600,27 @@ def aggregate_session_meta(sessions):
     }
 
 
+def compute_throughput_total_tokens(jsonl, meta):
+    """Return the 4-way throughput token total (input + output + cache_read +
+    cache_create) that powers the headline `stats.totalTokens` in the report.
+
+    This is the single source of truth for the "total tokens" number. It is
+    used both by generate_html (for the visible stat) and by main() (for the
+    integrity manifest), so the signed payload and the displayed headline can
+    never drift. See issue #6 / PR #7 for the shape of this calculation.
+    """
+    return (
+        jsonl.get("total_throughput_tokens", 0)
+        or (
+            jsonl.get("total_input_tokens", 0)
+            + jsonl.get("total_output_tokens", 0)
+            + jsonl.get("total_cache_read_tokens", 0)
+            + jsonl.get("total_cache_create_tokens", 0)
+        )
+        or meta.get("total_tokens", 0)
+    )
+
+
 # ── HTML Generation ────────────────────────────────────────────────────────
 
 def generate_writeup(data):
@@ -1965,14 +1986,7 @@ def generate_html(data):
     # (10% cache_read, 125% cache_create) against the 4-way perModelTokens
     # breakdown — keeping volume and cost as distinct concepts.
     # See issue #6 for the discussion.
-    total_tokens = jsonl.get(
-        "total_throughput_tokens", 0
-    ) or (
-        jsonl.get("total_input_tokens", 0)
-        + jsonl.get("total_output_tokens", 0)
-        + jsonl.get("total_cache_read_tokens", 0)
-        + jsonl.get("total_cache_create_tokens", 0)
-    ) or meta.get("total_tokens", 0)
+    total_tokens = compute_throughput_total_tokens(jsonl, meta)
     lifetime_tokens = stats_cache.get("lifetime_tokens", 0)
     total_hours = meta.get("total_duration_hours", 0)
     avg_duration = meta.get("avg_duration_minutes", 0)
@@ -2981,14 +2995,19 @@ def main():
         "perm_accumulation": perm_accumulation,
     }
 
-    # Build integrity manifest — key stats that the server can verify
+    # Build integrity manifest — key stats that the server can verify.
+    # IMPORTANT: `total_tokens` here MUST match the headline `stats.totalTokens`
+    # rendered by generate_html (the 4-way throughput total). If these diverge,
+    # server-side verification that compares visible stats to the signed payload
+    # will reject legitimate reports. Use the shared helper so there is exactly
+    # one source of truth.
     meta = data.get("session_meta_summary", {})
     jsonl = data.get("jsonl_metadata", {})
     integrity_payload = {
         "v": 2, "skill_version": VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "sessions": meta.get("session_count", 0),
-        "total_tokens": meta.get("total_tokens", 0),
+        "total_tokens": compute_throughput_total_tokens(jsonl, meta),
         "total_input_tokens": meta.get("total_input_tokens", 0),
         "total_output_tokens": meta.get("total_output_tokens", 0),
         "total_duration_minutes": meta.get("total_duration_minutes", 0),
