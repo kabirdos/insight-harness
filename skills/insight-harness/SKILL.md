@@ -86,11 +86,14 @@ This is the only supported invocation pattern. Do not start the script via `Bash
 
 ### Skipping showcase content (`--no-include-skills`)
 
-If you want a smaller report without per-skill READMEs and heroes (original 2.3.0 behavior), pass `--no-include-skills`. Same background + Monitor invocation pattern as above:
+If you want a smaller report without per-skill READMEs and heroes (original 2.3.0 behavior), pass `--no-include-skills`. Same Monitor invocation as above, just with a different flag:
 
-```bash
-python3 ~/.claude/skills/insight-harness/scripts/extract.py --no-include-skills
-```
+- `command`: `python3 ~/.claude/skills/insight-harness/scripts/extract.py --no-include-skills 2>&1`
+- `description`: `insight-harness extract progress`
+- `timeout_ms`: `3600000`
+- `persistent`: `false`
+
+Do not run this as a plain foreground Bash call — the timeout and progress-visibility concerns from the main "How to Run" section apply equally here.
 
 ## Updating
 
