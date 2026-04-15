@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,35 @@ CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 SESSION_META_DIR = CLAUDE_DIR / "usage-data" / "session-meta"
 SKILLS_DIR = CLAUDE_DIR / "skills"
+
+
+def resolve_report_username() -> str:
+    """Return a short, filename-safe user identifier for report filenames.
+
+    Preference order:
+      1. GitHub login via `gh api user --jq .login` — only if `gh` is present
+         and authenticated. Returns in ~200ms when it works.
+      2. OS username via Path.home().name — always available.
+
+    Any non-alphanumeric characters are stripped to keep the filename portable.
+    Falls back to "user" if both sources somehow produce an empty value.
+    """
+    candidate = None
+    try:
+        result = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            candidate = result.stdout.strip() or None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    if not candidate:
+        candidate = Path.home().name
+
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", candidate or "")
+    return safe or "user"
 PLUGINS_DIR = CLAUDE_DIR / "plugins"
 COMMANDS_DIR = CLAUDE_DIR / "commands"
 HOOKS_DIR = CLAUDE_DIR / "hooks"
@@ -3033,6 +3063,18 @@ def main():
     # namespace for the built-in /insights report; we shouldn't squat there.
     output_dir = CLAUDE_DIR / "insight-harness"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Dated filename: YYYY-MM-DD-<user>-insight-harness.html
+    # User resolution: GitHub login via `gh` CLI if authenticated, else OS
+    # username. GitHub login is preferred because it's the identity the user
+    # publishes under; OS username is the guaranteed fallback.
+    username = resolve_report_username()
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    dated_path = output_dir / f"{date_str}-{username}-insight-harness.html"
+    dated_path.write_text(html)
+
+    # Stable "latest" copy. Predictable path for bookmarks, docs, and other
+    # skills that reference the report; duplicates ~1.5MB per run (cheap).
     primary_path = output_dir / "report.html"
     primary_path.write_text(html)
 
@@ -3046,15 +3088,17 @@ def main():
     # Also save a dated copy in ~/Documents/Claude Reports/ if it exists
     reports_dir = Path.home() / "Documents" / "Claude Reports"
     if reports_dir.exists():
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        dated_path = reports_dir / f"insight-harness-{date_str}.html"
+        doc_path = reports_dir / f"{date_str}-{username}-insight-harness.html"
         counter = 2
-        while dated_path.exists():
-            dated_path = reports_dir / f"insight-harness-{date_str}-{counter}.html"
+        while doc_path.exists():
+            doc_path = reports_dir / f"{date_str}-{username}-insight-harness-{counter}.html"
             counter += 1
-        dated_path.write_text(html)
+        doc_path.write_text(html)
 
-    print(str(primary_path))
+    # Print the dated path — the log consumer (skill instructions) reads the
+    # last line as the canonical output location. The stable report.html still
+    # exists for predictable access.
+    print(str(dated_path))
 
     # Check for updates (non-blocking, silent on failure)
     check_for_updates()

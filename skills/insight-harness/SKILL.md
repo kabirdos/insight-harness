@@ -62,7 +62,7 @@ The extract walks thousands of JSONL files plus the user's home tree and can tak
 
 2. Tell the user the extract is running and that it can take several minutes on a heavy home directory. The harness will send a task-completion notification when the script exits — do not poll or sleep while waiting.
 
-3. Once the task completes, `Read` the log file at `/tmp/insight-harness-extract.log`. The **final line is the absolute path** to the generated HTML report (e.g. `/Users/you/.claude/insight-harness/report.html`). Everything above it is the phase log (`Extracting settings... / Scanning skills... / Reading permissions... / Generating HTML...`) — relay the interesting bits (which phases ran, any warnings) to the user.
+3. Once the task completes, `Read` the log file at `/tmp/insight-harness-extract.log`. The **final line is the absolute path** to the generated HTML report (e.g. `/Users/you/.claude/insight-harness/2026-04-15-kabirdos-insight-harness.html`). Everything above it is the phase log (`Extracting settings... / Scanning skills... / Reading permissions... / Generating HTML...`) — relay the interesting bits (which phases ran, any warnings) to the user. A stable "latest" copy is also written to `~/.claude/insight-harness/report.html` for predictable bookmarking.
 
 4. Open the report path in the user's browser via a plain (foreground) Bash call:
 
