@@ -1222,7 +1222,20 @@ def extract_stats_cache():
 
     lifetime_input = sum(m.get("input", 0) for m in model_tokens.values())
     lifetime_output = sum(m.get("output", 0) for m in model_tokens.values())
-    lifetime_tokens_inout = lifetime_input + lifetime_output
+    lifetime_cache_read = sum(m.get("cache_read", 0) for m in model_tokens.values())
+    lifetime_cache_create = sum(
+        m.get("cache_create", 0) for m in model_tokens.values()
+    )
+    # Billing-weighted (see comment at the 30d total_tokens site) — cache
+    # reads at 10%, cache creation at 125%, input + output at 100%.
+    # Kept in lockstep with the 30d formula so users can divide the two
+    # stats without the unit silently changing.
+    lifetime_tokens_inout = round(
+        lifetime_input
+        + lifetime_output
+        + lifetime_cache_read * 0.1
+        + lifetime_cache_create * 1.25
+    )
 
     return {
         "peak_day_messages": peak_day.get("messageCount", 0),
@@ -1944,18 +1957,19 @@ def generate_html(data):
     perm_accum = data.get("perm_accumulation", {})
 
     total_sessions = jsonl.get("sessions_with_data", meta.get("session_count", 0))
-    # Headline "Tokens" = full throughput across all 4 usage categories
-    # (input + output + cache_read + cache_creation). Matches the Claude
-    # Code status bar, ccusage, and Anthropic billing. For cache-heavy
-    # Claude Code workloads cache_read alone is typically 90%+ of real
-    # throughput, so input + output only under-reports by 10-50x. See #6.
-    total_tokens = jsonl.get(
-        "total_throughput_tokens", 0
-    ) or (
+    # "Billable Tokens" = billing-weighted sum mirroring API pricing:
+    # input + output at full rate, cache_read at 10% (90% discount), and
+    # cache_create at 125% (25% premium). Matches what a user would pay
+    # on a pure API plan and keeps this number internally consistent
+    # with the USD cost estimate. Pure input + output under-reports by
+    # ~2-3x because cache reads still account for real spend; raw
+    # throughput over-reports because it ignores the 90% cache discount.
+    # See issue #6.
+    total_tokens = round(
         jsonl.get("total_input_tokens", 0)
         + jsonl.get("total_output_tokens", 0)
-        + jsonl.get("total_cache_read_tokens", 0)
-        + jsonl.get("total_cache_create_tokens", 0)
+        + jsonl.get("total_cache_read_tokens", 0) * 0.1
+        + jsonl.get("total_cache_create_tokens", 0) * 1.25
     ) or meta.get("total_tokens", 0)
     lifetime_tokens = stats_cache.get("lifetime_tokens", 0)
     total_hours = meta.get("total_duration_hours", 0)
@@ -2482,8 +2496,8 @@ h3 {{ font-size:0.8rem; font-weight:600; color:var(--ink); margin:1rem 0 0.5rem;
 
 <div class="stats-grid">
     <div class="stat"><div class="stat-value">{total_sessions}</div><div class="stat-label">Sessions</div></div>
-    <div class="stat"><div class="stat-value">{fmt(total_tokens)}</div><div class="stat-label">Tokens</div></div>
-    <div class="stat"><div class="stat-value">{fmt(lifetime_tokens)}</div><div class="stat-label">Lifetime Tokens</div></div>
+    <div class="stat"><div class="stat-value">{fmt(total_tokens)}</div><div class="stat-label">Billable Tokens</div></div>
+    <div class="stat"><div class="stat-value">{fmt(lifetime_tokens)}</div><div class="stat-label">Lifetime Billable Tokens</div></div>
     <div class="stat"><div class="stat-value">{total_hours}h</div><div class="stat-label">Duration</div></div>
     <div class="stat"><div class="stat-value">{avg_duration:.0f}m</div><div class="stat-label">Avg Session</div></div>
     <div class="stat"><div class="stat-value">{len(skill_invocations)}</div><div class="stat-label">Skills Used</div></div>
