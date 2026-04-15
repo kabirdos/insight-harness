@@ -1017,16 +1017,32 @@ def extract_permissions_profile():
     # minutes on large dev machines (tens of minutes or hang entirely
     # when OrbStack/FUSE mounts are present).
     PRUNE_DIRS = {
-        "node_modules", ".git", "Library", ".cache", ".npm", ".Trash",
+        "node_modules", ".git", ".cache", ".npm", ".Trash",
         ".rustup", ".cargo", ".bun", ".pnpm-store", ".yarn", ".gem",
         "OrbStack", ".orbstack", ".docker", "venv", ".venv", ".tox",
         "__pycache__", ".next", ".turbo", ".vite", "dist", "build",
         ".gradle", ".m2", ".android", ".cocoapods", "Pods",
     }
-    home = str(Path.home())
+    # ~/Library is NOT pruned wholesale — macOS iCloud Drive lives under
+    # ~/Library/Mobile Documents and ~/Library/CloudStorage, and users keep
+    # real projects there. Prune only the heavy-but-never-a-project subpaths.
+    home_path = Path.home()
+    LIBRARY_PRUNE_ABSPATHS = {
+        str(home_path / "Library" / "Caches"),
+        str(home_path / "Library" / "Application Support"),
+        str(home_path / "Library" / "Containers"),
+        str(home_path / "Library" / "Group Containers"),
+        str(home_path / "Library" / "Logs"),
+        str(home_path / "Library" / "Developer"),
+    }
+    home = str(home_path)
     for dirpath, dirnames, filenames in os.walk(home, followlinks=False):
         # Mutate dirnames in place to prune traversal
-        dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in PRUNE_DIRS
+            and os.path.join(dirpath, d) not in LIBRARY_PRUNE_ABSPATHS
+        ]
         if "settings.local.json" in filenames and dirpath.endswith(os.sep + ".claude"):
             sf = Path(dirpath) / "settings.local.json"
             if len(sf.parts) > 10:
