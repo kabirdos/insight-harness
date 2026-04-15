@@ -1222,7 +1222,19 @@ def extract_stats_cache():
 
     lifetime_input = sum(m.get("input", 0) for m in model_tokens.values())
     lifetime_output = sum(m.get("output", 0) for m in model_tokens.values())
-    lifetime_tokens_inout = lifetime_input + lifetime_output
+    lifetime_cache_read = sum(m.get("cache_read", 0) for m in model_tokens.values())
+    lifetime_cache_create = sum(
+        m.get("cache_create", 0) for m in model_tokens.values()
+    )
+    # Full throughput across all 4 usage categories — matches the 30d
+    # total_tokens formula (see the long comment there) so users can
+    # divide the two stats without the unit silently changing.
+    lifetime_tokens_inout = (
+        lifetime_input
+        + lifetime_output
+        + lifetime_cache_read
+        + lifetime_cache_create
+    )
 
     return {
         "peak_day_messages": peak_day.get("messageCount", 0),
@@ -1944,7 +1956,23 @@ def generate_html(data):
     perm_accum = data.get("perm_accumulation", {})
 
     total_sessions = jsonl.get("sessions_with_data", meta.get("session_count", 0))
-    total_tokens = (jsonl.get("total_input_tokens", 0) + jsonl.get("total_output_tokens", 0)) or meta.get("total_tokens", 0)
+    # Headline "Tokens" is a VOLUME metric — sum of all 4 usage categories
+    # (input + output + cache_read + cache_creation), matching the Claude
+    # Code status bar, ccusage, and the Anthropic Console dashboard. This
+    # is the number every ecosystem tool reports and what users compare
+    # against. Dollar cost is a separate calculation (see
+    # insightful/src/lib/api-cost.ts) that applies proper billing weights
+    # (10% cache_read, 125% cache_create) against the 4-way perModelTokens
+    # breakdown — keeping volume and cost as distinct concepts.
+    # See issue #6 for the discussion.
+    total_tokens = jsonl.get(
+        "total_throughput_tokens", 0
+    ) or (
+        jsonl.get("total_input_tokens", 0)
+        + jsonl.get("total_output_tokens", 0)
+        + jsonl.get("total_cache_read_tokens", 0)
+        + jsonl.get("total_cache_create_tokens", 0)
+    ) or meta.get("total_tokens", 0)
     lifetime_tokens = stats_cache.get("lifetime_tokens", 0)
     total_hours = meta.get("total_duration_hours", 0)
     avg_duration = meta.get("avg_duration_minutes", 0)
