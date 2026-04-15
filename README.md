@@ -26,7 +26,7 @@ Run these two commands inside Claude Code:
 Then in any Claude Code session:
 
 ```
-/skill insight-harness
+/insight-harness
 ```
 
 …or just ask: _"run insight harness"_, _"show my harness"_, _"what skills do I use"_.
@@ -52,7 +52,7 @@ ln -s "$(pwd)/insight-harness/skills/insight-harness" ~/.claude/skills/insight-h
 
 ## Output
 
-The skill produces a structured report you can read directly, or upload to [insightharness.com](https://insightharness.com) to share as a public profile.
+The skill writes a single-file HTML report to `~/.claude/insight-harness/report.html` and opens it in your browser. Read it locally, or upload it to [insightharness.com](https://insightharness.com) to share as a public profile.
 
 ## License
 
