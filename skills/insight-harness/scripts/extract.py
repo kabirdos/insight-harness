@@ -34,7 +34,7 @@ HOOKS_DIR = CLAUDE_DIR / "hooks"
 AGENTS_DIR = CLAUDE_DIR / "agents"
 
 DAYS = 30
-VERSION = "2.6.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
+VERSION = "2.7.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
 ENV_ASSIGN = re.compile(r'^([A-Z_][A-Z0-9_]*)=')
 
 
