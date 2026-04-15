@@ -4,7 +4,7 @@ name: insight-harness
 description: Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days. A superset of /insights — adds token breakdowns, tool usage stats, skill inventory, and more. Upload to insightharness.com to share. Triggers on "insight harness", "harness profile", "my setup", "what skills do I use", "show my harness", or "harness report".
 user-invocable: true
 argument-hint: "insight-harness"
-allowed-tools: Bash, Read
+allowed-tools: Bash, Read, Monitor
 ---
 
 # Insight Harness
@@ -46,17 +46,31 @@ Everything from /insights, plus:
 
 ## How to Run
 
-Run the extraction script with `--include-skills` (the default — ships per-skill README + hero data alongside the usual stats) and open the result:
+The extract walks thousands of JSONL files plus the user's home tree and can take anywhere from 30 seconds to several minutes depending on machine size. A blocking foreground Bash call will hit its 10-minute ceiling on heavy setups and abort mid-run with no report produced.
 
-```bash
-python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills
-```
+**Always run the script in the background and stream progress via Monitor.** Do not call the script as a blocking Bash command. Do not set a custom `timeout` and hope it fits.
 
-Open in the browser:
+### Required invocation
 
-```bash
-open "$(python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills)"
-```
+1. Start the extract as a background Bash task:
+
+   ```bash
+   python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-skills
+   ```
+
+   Pass `run_in_background: true` to the Bash tool. `--include-skills` is the default behavior and ships per-skill README + hero data; see "Skipping showcase content" below if you need to opt out.
+
+2. Immediately attach the Monitor tool to the returned task id. Every stdout line the script prints (`Extracting settings... / Reading plugins... / Scanning skills... / Reading hooks... / Reading permissions... / Scanning JSONL... / Generating HTML...`) becomes a Monitor event — relay these phases to the user so they see progress instead of a silent hang.
+
+3. When the task completes, the script's **final stdout line is the absolute path** to the generated HTML report (e.g. `/Users/you/.claude/insight-harness/report.html`).
+
+4. Open that path in the user's browser:
+
+   ```bash
+   open <absolute-path-from-step-3>
+   ```
+
+This is the only supported invocation pattern. Any foreground-blocking call, or anything that swallows the script's stdout, regresses users who have large session histories or heavy home directories.
 
 ### What ships per skill
 
@@ -72,7 +86,7 @@ open "$(python3 ~/.claude/skills/insight-harness/scripts/extract.py --include-sk
 
 ### Skipping showcase content (`--no-include-skills`)
 
-If you want a smaller report without per-skill READMEs and heroes (original 2.3.0 behavior), pass `--no-include-skills`:
+If you want a smaller report without per-skill READMEs and heroes (original 2.3.0 behavior), pass `--no-include-skills`. Same background + Monitor invocation pattern as above:
 
 ```bash
 python3 ~/.claude/skills/insight-harness/scripts/extract.py --no-include-skills
