@@ -26,7 +26,7 @@ Run these two commands inside Claude Code:
 Then in any Claude Code session:
 
 ```
-/insight-harness
+/insight-harness:insight-harness
 ```
 
 …or just ask: _"run insight harness"_, _"show my harness"_, _"what skills do I use"_.
