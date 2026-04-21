@@ -210,9 +210,9 @@ _JPEG_SIG = b"\xff\xd8\xff"
 
 # Per-skill payload caps (post-PII-scrub). See plan
 # docs/plans/2026-04-12-002 → "Hard payload caps".
-MAX_HERO_BYTES = 300 * 1024
+MAX_HERO_BYTES = 500 * 1024
 MAX_README_BYTES = 100 * 1024
-MAX_PER_SKILL_BYTES = 400 * 1024
+MAX_PER_SKILL_BYTES = 600 * 1024
 TRUNCATION_MARKER = "\n\n<!-- truncated -->\n"
 
 # Global serialized harness_json budget — enforced in generate_html(), not here.
@@ -242,6 +242,7 @@ def _enforce_showcase_budget(harness_json, max_bytes):
         # Strategy: walk in REVERSE calls order (lowest-call first) and null
         # showcase fields until we fit. The list is already sorted desc by calls
         # in generate_html(), so iterate from the end.
+        dropped_names = []
         for entry in reversed(skills):
             if "readme_markdown" not in entry and "hero_base64" not in entry:
                 continue
@@ -251,6 +252,7 @@ def _enforce_showcase_budget(harness_json, max_bytes):
             entry["readme_markdown"] = None
             entry["hero_base64"] = None
             entry["hero_mime_type"] = None
+            dropped_names.append(entry.get("name"))
             running = len(json.dumps(harness_json))
             print(
                 f"  showcase budget cap: dropped showcase fields for {entry.get('name')!r} "
@@ -258,6 +260,13 @@ def _enforce_showcase_budget(harness_json, max_bytes):
                 file=sys.stderr,
             )
             if running <= max_bytes:
+                print(
+                    f"  showcase budget summary: dropped showcase content for {len(dropped_names)} "
+                    f"low-call skill(s) to fit the {max_bytes // 1024}KB payload cap "
+                    f"(stats still ship; heroes/READMEs do not). Skills affected: "
+                    f"{', '.join(repr(n) for n in dropped_names)}.",
+                    file=sys.stderr,
+                )
                 return
 
     # Fell out of the loop without converging. Could happen when:
