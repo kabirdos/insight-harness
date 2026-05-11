@@ -2930,17 +2930,40 @@ def save_token_to_config(token, config_path=None):
         )
     path = Path(config_path) if config_path is not None else PUBLISH_CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Write atomically-ish: write then chmod. We don't tempfile-rename
-    # because the directory is single-user and the file is small; an
-    # interrupted write yields a malformed json that load_token_from_config
-    # treats as "no token" — same surface as a fresh install.
-    with open(path, "w") as f:
-        json.dump({"token": token}, f)
+    # Create the file with 0600 perms BEFORE writing the secret. Using
+    # `open(path, "w")` then chmod() opens a TOCTOU window where the
+    # token sits on disk with the process umask (usually 022 → 0644).
+    # `os.open(..., O_CREAT|O_TRUNC|O_WRONLY, 0o600)` is the standard
+    # idiom for "create-or-truncate with explicit perms" — same approach
+    # the AWS CLI uses for ~/.aws/credentials.
+    payload = json.dumps({"token": token}).encode("utf-8")
+    try:
+        fd = os.open(
+            str(path),
+            os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except OSError:
+        # Some filesystems (e.g. Windows in some configs, certain network
+        # mounts) reject mode bits on os.open. Fall back to a plain write
+        # then chmod — best effort, with the same caveats as before.
+        with open(path, "w") as f:
+            f.write(payload.decode("utf-8"))
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return
+    # On platforms where the file pre-existed with looser perms, os.open's
+    # mode arg is only applied at creation. chmod defensively to cover the
+    # "config file existed at 0644 and we just truncated it" case.
     try:
         os.chmod(path, 0o600)
     except OSError:
-        # Some filesystems (e.g. Windows, network mounts) reject chmod.
-        # The token is still on disk; surface no error rather than abort.
         pass
 
 
@@ -3500,7 +3523,7 @@ def main(argv=None):
         # failure). Reading rather than re-encoding `html` avoids any
         # surprise encoding drift between Path.write_text and our POST.
         html_bytes = dated_path.read_bytes()
-        rc = publish_report(html_bytes, publish_token)
+        rc = publish_report(html_bytes, publish_token, confirm=args.confirm)
         # Update check is best-effort — keep it on the publish path too
         # so users who only ever --publish still get the nudge.
         check_for_updates()

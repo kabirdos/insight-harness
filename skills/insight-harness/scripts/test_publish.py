@@ -323,6 +323,138 @@ class PublishReportTests(unittest.TestCase):
             self.assertFalse(called["hit"])
 
 
+class MainWiringTests(unittest.TestCase):
+    """Light-touch tests that main() routes the publish flags correctly.
+
+    These don't run the full extraction pipeline — they short-circuit by
+    asserting early-exit behavior (e.g. --token alone, --publish without
+    config) so they stay fast and don't depend on a real ~/.claude tree.
+    """
+
+    def test_token_alone_writes_config_and_exits_0(self):
+        with TemporaryDirectory() as d:
+            cfg = Path(d) / "config.json"
+            with patch("extract.PUBLISH_CONFIG_PATH", cfg):
+                with patch.object(sys, "stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit) as ctx:
+                        extract.main(["--token", VALID_TOKEN])
+            self.assertEqual(ctx.exception.code, 0)
+            data = json.loads(cfg.read_text())
+            self.assertEqual(data, {"token": VALID_TOKEN})
+
+    def test_token_alone_with_malformed_exits_2(self):
+        with TemporaryDirectory() as d:
+            cfg = Path(d) / "config.json"
+            with patch("extract.PUBLISH_CONFIG_PATH", cfg):
+                with patch.object(sys, "stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit) as ctx:
+                        extract.main(["--token", "garbage"])
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertFalse(cfg.exists())
+
+    def test_publish_without_token_or_config_exits_2(self):
+        with TemporaryDirectory() as d:
+            cfg = Path(d) / "config.json"  # does not exist
+            with patch("extract.PUBLISH_CONFIG_PATH", cfg):
+                buf_err = io.StringIO()
+                with patch.object(sys, "stderr", buf_err):
+                    with self.assertRaises(SystemExit) as ctx:
+                        extract.main(["--publish"])
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("No token configured", buf_err.getvalue())
+
+    def test_publish_passes_confirm_through(self):
+        """Wiring test: --publish --confirm must reach publish_report(confirm=True).
+
+        Regression coverage for the P1 finding where main() dropped the
+        --confirm flag. We mock out the entire extraction pipeline and
+        assert on the args that reach publish_report.
+        """
+        captured = {}
+
+        def fake_publish(html_bytes, token, confirm=False, **kw):
+            captured["confirm"] = confirm
+            captured["token"] = token
+            return 0
+
+        with TemporaryDirectory() as d:
+            cfg = Path(d) / "config.json"
+            # Seed the config so --publish doesn't bail early.
+            extract.save_token_to_config(VALID_TOKEN, config_path=cfg)
+
+            # Stub every heavy extractor to a no-op return + dated_path
+            # write. We patch the writer step by intercepting publish_report
+            # after the HTML is generated.
+            patches = [
+                patch("extract.PUBLISH_CONFIG_PATH", cfg),
+                patch("extract.publish_report", side_effect=fake_publish),
+                patch("extract.extract_settings", return_value={"hooks": []}),
+                patch("extract.extract_installed_plugins", return_value=[]),
+                patch("extract.extract_skill_inventory", return_value=[]),
+                patch("extract.extract_hook_scripts", return_value={}),
+                patch("extract.extract_custom_agents", return_value=[]),
+                patch("extract.extract_harness_files", return_value={}),
+                patch("extract.extract_session_meta", return_value=[]),
+                patch("extract.aggregate_session_meta", return_value={}),
+                patch("extract.extract_jsonl_metadata", return_value={}),
+                patch("extract.extract_permissions_profile", return_value={}),
+                patch("extract.extract_insights_report", return_value=None),
+                patch("extract.extract_safety_posture", return_value={}),
+                patch("extract.extract_experimental_features", return_value={}),
+                patch("extract.extract_stats_cache", return_value={}),
+                patch("extract.extract_instruction_maturity", return_value={}),
+                patch("extract.extract_memory_architecture", return_value={}),
+                patch("extract.extract_agent_details", return_value=[]),
+                patch("extract.extract_team_configs", return_value={}),
+                patch("extract.extract_marketplace_diversity", return_value={}),
+                patch("extract.extract_statusline", return_value={}),
+                patch("extract.extract_ide_integration", return_value={}),
+                patch("extract.extract_hybrid_tools", return_value={}),
+                patch("extract.extract_blocklist_issues", return_value={}),
+                patch("extract.extract_permission_accumulation", return_value={}),
+                patch("extract.compute_throughput_total_tokens", return_value=0),
+                patch("extract.generate_html", return_value="<html></html>"),
+                patch("extract.CLAUDE_DIR", Path(d)),
+                patch("extract.check_for_updates"),
+                patch.object(sys, "stderr", io.StringIO()),
+            ]
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+
+            with self.assertRaises(SystemExit) as ctx:
+                extract.main(["--publish", "--confirm"])
+
+            self.assertEqual(ctx.exception.code, 0)
+            self.assertTrue(captured.get("confirm"))
+            self.assertEqual(captured.get("token"), VALID_TOKEN)
+
+
+class ConfigPermsTests(unittest.TestCase):
+    """The token must never be on disk with world/group-readable perms."""
+
+    def test_save_creates_file_with_0600_perms_even_with_loose_umask(self):
+        old_umask = os.umask(0o022)
+        try:
+            with TemporaryDirectory() as d:
+                path = Path(d) / "config.json"
+                extract.save_token_to_config(VALID_TOKEN, config_path=path)
+                mode = stat.S_IMODE(path.stat().st_mode)
+                self.assertEqual(mode, 0o600, oct(mode))
+        finally:
+            os.umask(old_umask)
+
+    def test_save_tightens_existing_loose_file(self):
+        """If a pre-existing config.json is 0644, save_token must clamp to 0600."""
+        with TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            path.write_text("{}")
+            os.chmod(path, 0o644)
+            extract.save_token_to_config(VALID_TOKEN, config_path=path)
+            mode = stat.S_IMODE(path.stat().st_mode)
+            self.assertEqual(mode, 0o600, oct(mode))
+
+
 class BaseUrlTests(unittest.TestCase):
     def test_env_var_overrides_default(self):
         with patch.dict(os.environ, {extract.PUBLISH_BASE_URL_ENV: "http://localhost:3000"}):
