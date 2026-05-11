@@ -454,6 +454,38 @@ class ConfigPermsTests(unittest.TestCase):
             mode = stat.S_IMODE(path.stat().st_mode)
             self.assertEqual(mode, 0o600, oct(mode))
 
+    def test_save_tightens_perms_BEFORE_writing_secret(self):
+        """Existing 0644 file: perms must be tightened before the secret hits disk.
+
+        We monkey-patch os.write so we can inspect the file mode at the
+        exact moment the secret would be written. The test fails if the
+        file is still group/world readable at that point.
+        """
+        with TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            path.write_text("{}")
+            os.chmod(path, 0o644)
+
+            mode_at_write = {"value": None}
+            real_write = os.write
+
+            def spy_write(fd, data):
+                try:
+                    mode_at_write["value"] = stat.S_IMODE(
+                        os.fstat(fd).st_mode
+                    )
+                except OSError:
+                    pass
+                return real_write(fd, data)
+
+            with patch("extract.os.write", side_effect=spy_write):
+                extract.save_token_to_config(VALID_TOKEN, config_path=path)
+
+            self.assertEqual(
+                mode_at_write["value"], 0o600,
+                "perms at write time were " + oct(mode_at_write["value"] or 0),
+            )
+
 
 class BaseUrlTests(unittest.TestCase):
     def test_env_var_overrides_default(self):

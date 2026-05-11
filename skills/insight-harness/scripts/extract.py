@@ -2944,6 +2944,16 @@ def save_token_to_config(token, config_path=None):
             0o600,
         )
         try:
+            # os.open's mode arg only applies at creation; if the file
+            # pre-existed (e.g. left at 0644 by an older skill version),
+            # O_TRUNC keeps the looser mode. fchmod via the open fd
+            # closes the window BEFORE we write the secret.
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                # Same caveat as below — some filesystems reject fchmod.
+                # Continue; the fallback chmod at function end still runs.
+                pass
             os.write(fd, payload)
         finally:
             os.close(fd)
