@@ -1,5 +1,5 @@
 ---
-version: 2.7.0
+version: 2.8.0
 name: insight-harness
 description: Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days. A superset of /insights — adds token breakdowns, tool usage stats, skill inventory, and more. Upload to insightharness.com to share. Triggers on "insight harness", "harness profile", "my setup", "what skills do I use", "show my harness", or "harness report".
 user-invocable: true
@@ -62,7 +62,7 @@ The extract walks thousands of JSONL files plus the user's home tree and can tak
 
 2. Tell the user the extract is running and that it can take several minutes on a heavy home directory. The harness will send a task-completion notification when the script exits — do not poll or sleep while waiting.
 
-3. Once the task completes, `Read` the log file at `/tmp/insight-harness-extract.log`. The **final line is the absolute path** to the generated HTML report (e.g. `/Users/you/.claude/insight-harness/2026-04-15-kabirdos-insight-harness.html`). Everything above it is the phase log (`Extracting settings... / Scanning skills... / Reading permissions... / Generating HTML...`) — relay the interesting bits (which phases ran, any warnings) to the user. A stable "latest" copy is also written to `~/.claude/insight-harness/report.html` for predictable bookmarking.
+3. Once the task completes, `Read` the log file at `/tmp/insight-harness-extract.log`. The **final line is the absolute path** to the generated HTML report (e.g. `/Users/you/.claude/insight-harness/2026-04-15-kabirdos-insight-harness.html`) when the skill is run **without `--publish`**. Under `--publish` the final line is `RESULT: <edit-url>` instead — see the "Output contract" section below. Everything above it is the phase log (`Extracting settings... / Scanning skills... / Reading permissions... / Generating HTML...`) — relay the interesting bits (which phases ran, any warnings) to the user. A stable "latest" copy is also written to `~/.claude/insight-harness/report.html` for predictable bookmarking.
 
 4. Open the report path in the user's browser via a plain (foreground) Bash call:
 
@@ -95,6 +95,37 @@ python3 ~/.claude/skills/insight-harness/scripts/extract.py --no-include-skills 
 ```
 
 Still pass `run_in_background: true` and read `/tmp/insight-harness-extract.log` after the task-completion notification fires — do not run this as a foreground blocking Bash call.
+
+## Output contract
+
+The skill has two output contracts depending on whether `--publish` was passed:
+
+- **Default (no `--publish`)** — the **final stdout line** is the **absolute path** to the dated HTML report (e.g. `/Users/you/.claude/insight-harness/2026-04-15-kabirdos-insight-harness.html`). The log consumer (you, reading `/tmp/insight-harness-extract.log` after the background task completes) takes that last line as the canonical output location, then opens it with `open "<path>"`. This is the contract every prior version has shipped under.
+
+- **`--publish`** — the **final stdout line** is `RESULT: <edit-url>`, where `<edit-url>` is `https://insightful.com/insights/<username>/<slug>/edit`. On success, the URL is also copied to the user's clipboard via `pbcopy` (macOS) / `wl-copy` / `xclip` (Linux). On any failure (401/429/5xx/network error) the report is saved to `~/.claude/insight-harness/report.html` and the skill exits non-zero with a stderr message — the final stdout line is NOT `RESULT:` in that case.
+
+When relaying output to the user, look at the last stdout line of the log and branch on the `RESULT:` prefix. If you see `RESULT: <url>`, the report is on insightful.com and the URL is in their clipboard; otherwise treat the line as a local file path and open it.
+
+## Direct publish (`--publish`)
+
+The `--publish` flag uploads the generated report directly to insightful.com instead of writing only a local file. It is opt-in — running `/insight-harness` without `--publish` keeps everything local, exactly as today.
+
+To get a token, the user visits https://insightful.com/upload, signs in, and copies the displayed `ih_...` token. Then either:
+
+```bash
+# One-shot — save the token to ~/.claude/insight-harness/config.json AND publish this run
+python3 ~/.claude/skills/insight-harness/scripts/extract.py --publish --token=ih_... > /tmp/insight-harness-extract.log 2>&1
+
+# Save the token now; publish later runs use it automatically
+python3 ~/.claude/skills/insight-harness/scripts/extract.py --token=ih_...
+
+# Subsequent runs read the saved token from config — no --token needed
+python3 ~/.claude/skills/insight-harness/scripts/extract.py --publish > /tmp/insight-harness-extract.log 2>&1
+```
+
+The token is persisted at `~/.claude/insight-harness/config.json` with file mode `0600`. It is never echoed to stdout. If a user pastes the command into a chat and the line scrolls past, the token is still in their shell history — the on-screen warning on the upload page explains the rotation flow.
+
+Optional `--confirm` adds an interactive `[y/N]` prompt before the POST. In a non-TTY context (which is how Claude Code's background Bash invocations look), `--confirm` short-circuits: the skill saves locally and exits 0 without POSTing.
 
 ## Updating
 
