@@ -3115,6 +3115,9 @@ def handle_publish_response(status, body, headers, html_bytes, report_path=None)
                 "Your report is saved at " + str(saved) + ".",
                 file=sys.stderr,
             )
+            # Emit the machine-readable LOCAL: line so consumers parsing
+            # the last stdout line can still find the saved report.
+            print("LOCAL: " + str(saved))
             return 2
         copy_to_clipboard(edit_url)
         print("RESULT: " + edit_url)
@@ -3128,6 +3131,7 @@ def handle_publish_response(status, body, headers, html_bytes, report_path=None)
             "Your report is saved at " + str(saved) + ".",
             file=sys.stderr,
         )
+        print("LOCAL: " + str(saved))
         return 2
     if status == 429:
         retry_after = headers.get("Retry-After") or headers.get("retry-after") or "unknown"
@@ -3137,6 +3141,7 @@ def handle_publish_response(status, body, headers, html_bytes, report_path=None)
             + message + ". Your report is saved at " + str(saved) + ".",
             file=sys.stderr,
         )
+        print("LOCAL: " + str(saved))
         return 2
     # 5xx and anything else from the server
     message = _decode_error_message(body) or ("HTTP " + str(status))
@@ -3145,6 +3150,7 @@ def handle_publish_response(status, body, headers, html_bytes, report_path=None)
         + ". Your report is saved at " + str(saved) + ".",
         file=sys.stderr,
     )
+    print("LOCAL: " + str(saved))
     return 2
 
 
@@ -3184,6 +3190,7 @@ def publish_report(html_bytes, token, confirm=False, report_path=None, opener=No
                 "Skipping upload. Your report is saved at " + str(saved) + ".",
                 file=sys.stderr,
             )
+            print("LOCAL: " + str(saved))
             return 0
         try:
             answer = input("Publish this report to insightful.com? [y/N] ").strip().lower()
@@ -3195,6 +3202,7 @@ def publish_report(html_bytes, token, confirm=False, report_path=None, opener=No
                 "Cancelled. Your report is saved at " + str(saved) + ".",
                 file=sys.stderr,
             )
+            print("LOCAL: " + str(saved))
             return 0
 
     try:
@@ -3206,6 +3214,7 @@ def publish_report(html_bytes, token, confirm=False, report_path=None, opener=No
             + ". Your report is saved at " + str(saved) + ".",
             file=sys.stderr,
         )
+        print("LOCAL: " + str(saved))
         return 2
     except Exception as e:  # noqa: BLE001 — last-resort guard
         saved = _save_html_locally(html_bytes, report_path)
@@ -3214,6 +3223,7 @@ def publish_report(html_bytes, token, confirm=False, report_path=None, opener=No
             + ". Your report is saved at " + str(saved) + ".",
             file=sys.stderr,
         )
+        print("LOCAL: " + str(saved))
         return 2
 
     return handle_publish_response(status, body, headers, html_bytes, report_path)

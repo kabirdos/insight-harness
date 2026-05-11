@@ -207,7 +207,9 @@ class PublishReportTests(unittest.TestCase):
         with TemporaryDirectory() as d:
             report = Path(d) / "report.html"
             buf_err = io.StringIO()
-            with patch.object(sys, "stderr", buf_err):
+            buf_out = io.StringIO()
+            with patch.object(sys, "stderr", buf_err), \
+                 patch.object(sys, "stdout", buf_out):
                 rc = extract.publish_report(
                     b"<html>payload</html>", VALID_TOKEN,
                     report_path=report, opener=opener,
@@ -215,6 +217,13 @@ class PublishReportTests(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertTrue(report.exists())
             self.assertIn("expired or revoked", buf_err.getvalue())
+            # Final stdout line must be machine-readable LOCAL: <path>
+            # so the skill consumer can branch on prefix without parsing
+            # human-language stderr.
+            self.assertEqual(
+                buf_out.getvalue().strip().splitlines()[-1],
+                "LOCAL: " + str(report),
+            )
 
     def test_429_surfaces_retry_after(self):
         opener = lambda req, timeout=None: _fake_response(  # noqa: E731
@@ -274,8 +283,10 @@ class PublishReportTests(unittest.TestCase):
         with TemporaryDirectory() as d:
             report = Path(d) / "report.html"
             buf_err = io.StringIO()
+            buf_out = io.StringIO()
             with patch("sys.stdin.isatty", return_value=False), \
-                 patch.object(sys, "stderr", buf_err):
+                 patch.object(sys, "stderr", buf_err), \
+                 patch.object(sys, "stdout", buf_out):
                 rc = extract.publish_report(
                     b"<html></html>", VALID_TOKEN,
                     confirm=True, report_path=report, opener=opener,
@@ -283,6 +294,12 @@ class PublishReportTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertFalse(called["hit"])
             self.assertTrue(report.exists())
+            # Non-TTY confirm fall-through must emit the LOCAL: contract
+            # too so the consumer doesn't try to `open` an error message.
+            self.assertEqual(
+                buf_out.getvalue().strip().splitlines()[-1],
+                "LOCAL: " + str(report),
+            )
 
     def test_confirm_yes_proceeds(self):
         opener = lambda req, timeout=None: _fake_response(  # noqa: E731
