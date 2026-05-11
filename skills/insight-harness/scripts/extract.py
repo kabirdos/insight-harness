@@ -2930,51 +2930,47 @@ def save_token_to_config(token, config_path=None):
         )
     path = Path(config_path) if config_path is not None else PUBLISH_CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Create the file with 0600 perms BEFORE writing the secret. Using
-    # `open(path, "w")` then chmod() opens a TOCTOU window where the
-    # token sits on disk with the process umask (usually 022 → 0644).
-    # `os.open(..., O_CREAT|O_TRUNC|O_WRONLY, 0o600)` is the standard
-    # idiom for "create-or-truncate with explicit perms" — same approach
-    # the AWS CLI uses for ~/.aws/credentials.
+
+    # Write to a fresh same-directory temp file with O_CREAT|O_EXCL and
+    # mode 0o600, then atomically rename over the destination. This is
+    # the standard secure-credential idiom (used by AWS CLI, GnuPG, SSH):
+    #
+    # - O_EXCL guarantees a fresh inode — we never reuse a pre-existing
+    #   inode that some other process might already have an open fd to.
+    # - The mode is set at creation, so the file is never world-readable.
+    # - os.replace is atomic on POSIX; readers either see the old or new
+    #   file, never a partial write.
+    # - Any process that already had the OLD config.json open keeps that
+    #   fd pointing at the orphaned inode and cannot read the new token.
     payload = json.dumps({"token": token}).encode("utf-8")
+    tmp_path = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex[:8])
     try:
         fd = os.open(
-            str(path),
-            os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+            str(tmp_path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
             0o600,
         )
         try:
-            # os.open's mode arg only applies at creation; if the file
-            # pre-existed (e.g. left at 0644 by an older skill version),
-            # O_TRUNC keeps the looser mode. fchmod via the open fd
-            # closes the window BEFORE we write the secret.
-            try:
-                os.fchmod(fd, 0o600)
-            except OSError:
-                # Same caveat as below — some filesystems reject fchmod.
-                # Continue; the fallback chmod at function end still runs.
-                pass
             os.write(fd, payload)
         finally:
             os.close(fd)
+        os.replace(str(tmp_path), str(path))
     except OSError:
         # Some filesystems (e.g. Windows in some configs, certain network
-        # mounts) reject mode bits on os.open. Fall back to a plain write
-        # then chmod — best effort, with the same caveats as before.
+        # mounts) reject either O_EXCL with mode bits, or atomic replace.
+        # Fall back to a plain write-then-chmod — best effort. The
+        # fallback is strictly less safe than the primary path; users on
+        # affected filesystems should be aware.
+        try:
+            tmp_path.unlink()
+        except (FileNotFoundError, OSError):
+            pass
         with open(path, "w") as f:
             f.write(payload.decode("utf-8"))
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
-        return
-    # On platforms where the file pre-existed with looser perms, os.open's
-    # mode arg is only applied at creation. chmod defensively to cover the
-    # "config file existed at 0644 and we just truncated it" case.
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def load_token_from_config(config_path=None):

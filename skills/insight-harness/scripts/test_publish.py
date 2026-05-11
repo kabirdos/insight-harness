@@ -457,9 +457,9 @@ class ConfigPermsTests(unittest.TestCase):
     def test_save_tightens_perms_BEFORE_writing_secret(self):
         """Existing 0644 file: perms must be tightened before the secret hits disk.
 
-        We monkey-patch os.write so we can inspect the file mode at the
-        exact moment the secret would be written. The test fails if the
-        file is still group/world readable at that point.
+        With the temp-file + atomic-rename approach the secret is always
+        written to a fresh 0600 inode, so the file mode at write time is
+        guaranteed 0600 regardless of the pre-existing config's perms.
         """
         with TemporaryDirectory() as d:
             path = Path(d) / "config.json"
@@ -485,6 +485,39 @@ class ConfigPermsTests(unittest.TestCase):
                 mode_at_write["value"], 0o600,
                 "perms at write time were " + oct(mode_at_write["value"] or 0),
             )
+
+    def test_save_uses_fresh_inode_atomic_rename(self):
+        """An old fd opened on config.json must not see the new token.
+
+        Verifies the security property the temp-file pattern is supposed
+        to provide: a process that already had the OLD inode open keeps
+        reading the OLD contents, even after a new save lands a new
+        token at the same pathname.
+        """
+        with TemporaryDirectory() as d:
+            path = Path(d) / "config.json"
+            path.write_text('{"token":"old"}')
+            os.chmod(path, 0o644)
+            # Open the old inode BEFORE the save. This fd survives.
+            old_fd = os.open(str(path), os.O_RDONLY)
+            try:
+                old_inode = os.fstat(old_fd).st_ino
+                extract.save_token_to_config(VALID_TOKEN, config_path=path)
+                new_inode = path.stat().st_ino
+                self.assertNotEqual(
+                    old_inode, new_inode,
+                    "save_token_to_config must produce a fresh inode",
+                )
+                # Reading the orphaned fd still sees the OLD contents.
+                old_contents = b""
+                while True:
+                    chunk = os.read(old_fd, 4096)
+                    if not chunk:
+                        break
+                    old_contents += chunk
+                self.assertEqual(old_contents, b'{"token":"old"}')
+            finally:
+                os.close(old_fd)
 
 
 class BaseUrlTests(unittest.TestCase):
