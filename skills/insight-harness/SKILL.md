@@ -100,7 +100,7 @@ Still pass `run_in_background: true` and read `/tmp/insight-harness-extract.log`
 
 The skill emits a **machine-readable final stdout line** in every mode. Parse the last line of `/tmp/insight-harness-extract.log` and branch on the prefix:
 
-- **`RESULT: <edit-url>`** — `--publish` succeeded. The report is live at `<edit-url>` (e.g. `https://insightful.com/insights/<username>/<slug>/edit`) and the URL is already on the user's clipboard. Relay the URL to the user; do not run `open`.
+- **`RESULT: <edit-url>`** — `--publish` succeeded. The report is live at `<edit-url>` (e.g. `https://insightharness.com/insights/<username>/<slug>/edit`) and the URL is already on the user's clipboard. Relay the URL to the user; do not run `open`.
 - **`LOCAL: <absolute-path>`** — `--publish` was attempted but failed (401/429/5xx, network error, malformed response, non-TTY `--confirm` fallthrough). The HTML is at `<absolute-path>`. Open it with `open "<absolute-path>"` and read the stderr text above the `LOCAL:` line to explain why publish failed.
 - **`<absolute-path>` (bare path, no prefix)** — `--publish` was NOT passed. This is the legacy contract — every prior version has shipped under it. Open it with `open "<absolute-path>"`.
 
@@ -111,7 +111,7 @@ Concrete tail-line examples for each case:
 /Users/you/.claude/insight-harness/2026-04-15-kabirdos-insight-harness.html
 
 # --publish, success
-RESULT: https://insightful.com/insights/kabirdos/2026-04-15-abc123/edit
+RESULT: https://insightharness.com/insights/kabirdos/2026-04-15-abc123/edit
 
 # --publish, 401 (token expired)
 LOCAL: /Users/you/.claude/insight-harness/report.html
@@ -121,9 +121,9 @@ In all three cases the script also writes a stable copy to `~/.claude/insight-ha
 
 ## Direct publish (`--publish`)
 
-The `--publish` flag uploads the generated report directly to `insightful.com` (the upload destination — note: the marketplace listing still references `insightharness.com`; both names exist in user-facing copy and will be reconciled in a follow-up). It is opt-in — running `/insight-harness` without `--publish` keeps everything local, exactly as today.
+The `--publish` flag uploads the generated report directly to `insightharness.com`. It is opt-in — running `/insight-harness` without `--publish` keeps everything local, exactly as today.
 
-To get a token, the user visits https://insightful.com/upload, signs in, and copies the displayed `ih_...` token. Then either:
+To get a token, the user visits https://insightharness.com/upload, signs in, and copies the displayed `ih_...` token. Then either:
 
 ```bash
 # One-shot — save the token AND publish this run. SAME background-Bash

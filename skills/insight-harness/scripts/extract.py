@@ -2893,7 +2893,7 @@ function switchTab(tab) {{
 # ── Direct Publish (--publish / --token / --confirm) ──────────────────────
 #
 # Wave 5 of the tokenized direct-post flow: skill-side token storage and
-# upload to https://insightful.com/api/upload. See
+# upload to https://insightharness.com/api/upload. See
 # docs/plans/2026-04-22-001-feat-tokenized-direct-post-plan.md in the
 # `insightful` repo for the full design.
 #
@@ -2901,7 +2901,7 @@ function switchTab(tab) {{
 # 3 + 12 + 64 = 79 chars, all lowercase hex after the `ih_` prefix. No
 # internal delimiter — fixed-position split. Must validate before storing.
 
-PUBLISH_DEFAULT_BASE_URL = "https://insightful.com"
+PUBLISH_DEFAULT_BASE_URL = "https://insightharness.com"
 PUBLISH_BASE_URL_ENV = "INSIGHT_HARNESS_BASE_URL"
 PUBLISH_CONFIG_PATH = CLAUDE_DIR / "insight-harness" / "config.json"
 PUBLISH_REPORT_PATH = CLAUDE_DIR / "insight-harness" / "report.html"
@@ -3127,7 +3127,7 @@ def handle_publish_response(status, body, headers, html_bytes, report_path=None)
     if status == 401:
         print(
             "Your token is expired or revoked. Visit "
-            "https://insightful.com/upload for a new one. "
+            "https://insightharness.com/upload for a new one. "
             "Your report is saved at " + str(saved) + ".",
             file=sys.stderr,
         )
@@ -3193,7 +3193,7 @@ def publish_report(html_bytes, token, confirm=False, report_path=None, opener=No
             print("LOCAL: " + str(saved))
             return 0
         try:
-            answer = input("Publish this report to insightful.com? [y/N] ").strip().lower()
+            answer = input("Publish this report to insightharness.com? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             answer = ""
         if answer not in ("y", "yes"):
@@ -3210,7 +3210,7 @@ def publish_report(html_bytes, token, confirm=False, report_path=None, opener=No
     except urllib.error.URLError as e:
         saved = _save_html_locally(html_bytes, report_path)
         print(
-            "Network error reaching insightful.com: " + str(e.reason)
+            "Network error reaching insightharness.com: " + str(e.reason)
             + ". Your report is saved at " + str(saved) + ".",
             file=sys.stderr,
         )
@@ -3265,7 +3265,7 @@ def build_arg_parser():
     # New publish flags.
     parser.add_argument(
         "--publish", action="store_true",
-        help="POST the generated HTML to insightful.com after extraction.",
+        help="POST the generated HTML to insightharness.com after extraction.",
     )
     parser.add_argument(
         "--token", default=None, metavar="TOKEN",
@@ -3332,7 +3332,7 @@ def main(argv=None):
             publish_token = load_token_from_config()
             if publish_token is None:
                 print(
-                    "No token configured. Visit https://insightful.com/upload "
+                    "No token configured. Visit https://insightharness.com/upload "
                     "to get one.",
                     file=sys.stderr,
                 )

@@ -185,7 +185,7 @@ class PostReportTests(unittest.TestCase):
 
 class PublishReportTests(unittest.TestCase):
     def test_200_prints_result_line_and_exits_0(self):
-        body = json.dumps({"editUrl": "https://insightful.com/edit/abc"}).encode()
+        body = json.dumps({"editUrl": "https://insightharness.com/edit/abc"}).encode()
         opener = lambda req, timeout=None: _fake_response(200, body=body)  # noqa: E731
         with TemporaryDirectory() as d:
             report = Path(d) / "report.html"
@@ -199,7 +199,7 @@ class PublishReportTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(
                 buf_out.getvalue().strip().splitlines()[-1],
-                "RESULT: https://insightful.com/edit/abc",
+                "RESULT: https://insightharness.com/edit/abc",
             )
 
     def test_401_saves_html_and_exits_2(self):
@@ -304,7 +304,7 @@ class PublishReportTests(unittest.TestCase):
     def test_confirm_yes_proceeds(self):
         opener = lambda req, timeout=None: _fake_response(  # noqa: E731
             200,
-            body=json.dumps({"editUrl": "https://insightful.com/edit/z"}).encode(),
+            body=json.dumps({"editUrl": "https://insightharness.com/edit/z"}).encode(),
         )
         with TemporaryDirectory() as d:
             report = Path(d) / "report.html"

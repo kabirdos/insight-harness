@@ -31,7 +31,7 @@ Claude runs the extraction script against `~/.claude/` and opens the generated H
 ## What this does and doesn't do
 
 - **One-shot snapshot, not a daemon.** The script runs once, writes a single HTML file, and exits. It does **not** install hooks, background jobs, telemetry, or anything that keeps running after it finishes. Re-run it whenever you want a fresh snapshot; nothing changes in your harness between runs.
-- **Output stays local by default.** The generated HTML lives at `~/.claude/insight-harness/report.html` on your machine. It only reaches [insightful.com](https://insightful.com) if you (a) drag-drop the file onto the upload page yourself, or (b) opt in to the direct-publish flow with `--publish` (see below).
+- **Output stays local by default.** The generated HTML lives at `~/.claude/insight-harness/report.html` on your machine. It only reaches [insightharness.com](https://insightharness.com) if you (a) drag-drop the file onto the upload page yourself, or (b) opt in to the direct-publish flow with `--publish` (see below).
 - **PII scrubbing runs on your machine, before anything ships.** Git name/email, OS username paths (`/Users/<you>`, `/home/<you>`), GitHub URLs containing your username, and `@<you>` mentions are replaced with placeholders in the extraction script itself — not on the server. You can open the HTML and inspect every string before uploading.
 - **Shareable content is opt-out at the skill level.** Any skill with `repo: private` or `repo: none` in its SKILL.md frontmatter is excluded entirely — not just the README + hero, but the invocation count itself, so a private skill never appears in the report at all. Skills without that flag ship their README and hero image by default. Pass `--no-include-skills` to strip README + hero data from every skill in a single run. **Review your hero images before uploading** — the scrubber can't read pixels.
 
@@ -67,10 +67,10 @@ After install, run `/insight-harness` or just mention "insight harness", "harnes
 
 ## Direct publish (optional)
 
-If you don't want to drag-drop the report onto the upload page each time, the skill can POST the generated HTML straight to insightful.com:
+If you don't want to drag-drop the report onto the upload page each time, the skill can POST the generated HTML straight to insightharness.com:
 
 ```bash
-# Visit https://insightful.com/upload, sign in, copy your ih_... token, then:
+# Visit https://insightharness.com/upload, sign in, copy your ih_... token, then:
 /insight-harness --publish --token=ih_...
 ```
 
