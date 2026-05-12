@@ -11,14 +11,19 @@ For Bash commands, ONLY the first token (command name) is extracted using a safe
 4-step normalizer that strips env var assignments and comment lines.
 """
 
+import argparse
 import base64
 import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -64,7 +69,7 @@ HOOKS_DIR = CLAUDE_DIR / "hooks"
 AGENTS_DIR = CLAUDE_DIR / "agents"
 
 DAYS = 30
-VERSION = "2.7.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
+VERSION = "2.8.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
 ENV_ASSIGN = re.compile(r'^([A-Z_][A-Z0-9_]*)=')
 
 
@@ -2885,6 +2890,395 @@ function switchTab(tab) {{
     return html
 
 
+# ── Direct Publish (--publish / --token / --confirm) ──────────────────────
+#
+# Wave 5 of the tokenized direct-post flow: skill-side token storage and
+# upload to https://insightharness.com/api/upload. See
+# docs/plans/2026-04-22-001-feat-tokenized-direct-post-plan.md in the
+# `insightful` repo for the full design.
+#
+# Token format (Decision 2): `ih_<12 hex selector><64 hex secret>` =
+# 3 + 12 + 64 = 79 chars, all lowercase hex after the `ih_` prefix. No
+# internal delimiter — fixed-position split. Must validate before storing.
+
+PUBLISH_DEFAULT_BASE_URL = "https://insightharness.com"
+PUBLISH_BASE_URL_ENV = "INSIGHT_HARNESS_BASE_URL"
+PUBLISH_CONFIG_PATH = CLAUDE_DIR / "insight-harness" / "config.json"
+PUBLISH_REPORT_PATH = CLAUDE_DIR / "insight-harness" / "report.html"
+TOKEN_RE = re.compile(r"^ih_[0-9a-f]{12}[0-9a-f]{64}$")
+
+
+def is_valid_token(token):
+    """Return True iff `token` matches the `ih_<12hex><64hex>` shape."""
+    return isinstance(token, str) and bool(TOKEN_RE.match(token))
+
+
+def publish_base_url():
+    """Resolve the base URL for POST /api/upload, honoring the env override."""
+    return os.environ.get(PUBLISH_BASE_URL_ENV) or PUBLISH_DEFAULT_BASE_URL
+
+
+def save_token_to_config(token, config_path=None):
+    """Persist `{ "token": token }` to config_path with mode 0600.
+
+    Raises ValueError if the token is malformed. The caller is responsible
+    for translating that into a non-zero exit + user-facing message.
+    """
+    if not is_valid_token(token):
+        raise ValueError(
+            "Token must look like ih_<12 hex chars><64 hex chars>."
+        )
+    path = Path(config_path) if config_path is not None else PUBLISH_CONFIG_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write to a fresh same-directory temp file with O_CREAT|O_EXCL and
+    # mode 0o600, then atomically rename over the destination. This is
+    # the standard secure-credential idiom (used by AWS CLI, GnuPG, SSH):
+    #
+    # - O_EXCL guarantees a fresh inode — we never reuse a pre-existing
+    #   inode that some other process might already have an open fd to.
+    # - The mode is set at creation, so the file is never world-readable.
+    # - os.replace is atomic on POSIX; readers either see the old or new
+    #   file, never a partial write.
+    # - Any process that already had the OLD config.json open keeps that
+    #   fd pointing at the orphaned inode and cannot read the new token.
+    payload = json.dumps({"token": token}).encode("utf-8")
+    tmp_path = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex[:8])
+    try:
+        fd = os.open(
+            str(tmp_path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp_path), str(path))
+    except OSError:
+        # Some filesystems (e.g. Windows in some configs, certain network
+        # mounts) reject either O_EXCL with mode bits, or atomic replace.
+        # Fall back to a plain write-then-chmod — best effort. The
+        # fallback is strictly less safe than the primary path; users on
+        # affected filesystems should be aware.
+        try:
+            tmp_path.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+        with open(path, "w") as f:
+            f.write(payload.decode("utf-8"))
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def load_token_from_config(config_path=None):
+    """Read the token from config; return None if missing or malformed.
+
+    Defensively re-chmod to 0600 if the file's existing perms allow group
+    or world access. We do not warn — re-chmod is the safer default than
+    failing the publish flow over a permissions drift.
+    """
+    path = Path(config_path) if config_path is not None else PUBLISH_CONFIG_PATH
+    if not path.exists():
+        return None
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode != 0o600:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    token = data.get("token") if isinstance(data, dict) else None
+    if not is_valid_token(token):
+        return None
+    return token
+
+
+def copy_to_clipboard(text):
+    """Best-effort clipboard copy: pbcopy → wl-copy → xclip. Silent on miss.
+
+    Returns True on success, False otherwise. No subprocess output is
+    propagated to stdout — we never want to corrupt the final RESULT line.
+    """
+    candidates = [
+        ["pbcopy"],
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+    ]
+    for cmd in candidates:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(
+                cmd,
+                input=text.encode("utf-8"),
+                check=True,
+                timeout=3,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except (subprocess.SubprocessError, OSError):
+            continue
+    return False
+
+
+def _save_html_locally(html_bytes, report_path=None):
+    """Mirror html_bytes to `~/.claude/insight-harness/report.html`.
+
+    The dated path is the primary output of the extraction phase; the
+    publish path's failure modes are documented as "your report is saved
+    at <stable path>." This function keeps that promise even when the
+    server rejects the upload (401/429/5xx).
+    """
+    path = Path(report_path) if report_path is not None else PUBLISH_REPORT_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(html_bytes, bytes):
+        path.write_bytes(html_bytes)
+    else:
+        path.write_text(html_bytes)
+    return path
+
+
+def post_report(
+    html_bytes,
+    token,
+    upload_id=None,
+    base_url=None,
+    opener=None,
+):
+    """POST the HTML payload to /api/upload. Returns (status, body, headers).
+
+    Pure I/O helper — does NOT print, does NOT exit. The caller decides
+    how to render errors. `opener` is dependency-injection for tests so
+    they can avoid monkey-patching the module-level `urllib.request`.
+    """
+    if upload_id is None:
+        upload_id = str(uuid.uuid4())
+    if base_url is None:
+        base_url = publish_base_url()
+    url = base_url.rstrip("/") + "/api/upload"
+    request = urllib.request.Request(
+        url,
+        data=html_bytes if isinstance(html_bytes, bytes) else html_bytes.encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/octet-stream",
+            "X-Upload-Id": upload_id,
+        },
+    )
+    open_fn = opener or urllib.request.urlopen
+    try:
+        with open_fn(request, timeout=60) as response:
+            return response.status, response.read(), dict(response.headers)
+    except urllib.error.HTTPError as e:
+        # HTTPError IS the response on non-2xx. Capture body + headers
+        # exactly like the success path so the caller can render 401/429.
+        body = b""
+        try:
+            body = e.read()
+        except Exception:
+            pass
+        return e.code, body, dict(e.headers or {})
+
+
+def handle_publish_response(status, body, headers, html_bytes, report_path=None):
+    """Translate a (status, body, headers) tuple into stdout + exit code.
+
+    Returns the exit code; callers should `sys.exit(rc)` themselves so
+    main() stays the single exit point and tests can assert without
+    needing to capture SystemExit.
+
+    Side effects: prints RESULT/error lines, copies edit URL on success,
+    writes the HTML to the stable report path on failure.
+    """
+    if status == 200:
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
+        edit_url = payload.get("editUrl") if isinstance(payload, dict) else None
+        if not edit_url:
+            saved = _save_html_locally(html_bytes, report_path)
+            print(
+                "Upload succeeded but server response was malformed. "
+                "Your report is saved at " + str(saved) + ".",
+                file=sys.stderr,
+            )
+            # Emit the machine-readable LOCAL: line so consumers parsing
+            # the last stdout line can still find the saved report.
+            print("LOCAL: " + str(saved))
+            return 2
+        copy_to_clipboard(edit_url)
+        print("RESULT: " + edit_url)
+        return 0
+
+    saved = _save_html_locally(html_bytes, report_path)
+    if status == 401:
+        print(
+            "Your token is expired or revoked. Visit "
+            "https://insightharness.com/upload for a new one. "
+            "Your report is saved at " + str(saved) + ".",
+            file=sys.stderr,
+        )
+        print("LOCAL: " + str(saved))
+        return 2
+    if status == 429:
+        retry_after = headers.get("Retry-After") or headers.get("retry-after") or "unknown"
+        message = _decode_error_message(body) or "rate limited"
+        print(
+            "Rate limited (Retry-After: " + str(retry_after) + "): "
+            + message + ". Your report is saved at " + str(saved) + ".",
+            file=sys.stderr,
+        )
+        print("LOCAL: " + str(saved))
+        return 2
+    # 5xx and anything else from the server
+    message = _decode_error_message(body) or ("HTTP " + str(status))
+    print(
+        "Upload failed: " + message
+        + ". Your report is saved at " + str(saved) + ".",
+        file=sys.stderr,
+    )
+    print("LOCAL: " + str(saved))
+    return 2
+
+
+def _decode_error_message(body):
+    """Best-effort: pull `error` or top-level message out of a JSON body."""
+    if not body:
+        return None
+    try:
+        decoded = body.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        return None
+    try:
+        data = json.loads(decoded)
+        if isinstance(data, dict):
+            for key in ("error", "message", "detail"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    except json.JSONDecodeError:
+        pass
+    # Fall back to the raw body, truncated.
+    decoded = decoded.strip()
+    return decoded[:200] if decoded else None
+
+
+def publish_report(html_bytes, token, confirm=False, report_path=None, opener=None):
+    """Top-level publish flow used by main() under --publish.
+
+    Returns the exit code for the process. Pulled out of main() so the
+    test suite can exercise the network paths without invoking extraction.
+    """
+    if confirm:
+        if not sys.stdin.isatty():
+            saved = _save_html_locally(html_bytes, report_path)
+            print(
+                "--confirm passed but stdin is not a TTY. "
+                "Skipping upload. Your report is saved at " + str(saved) + ".",
+                file=sys.stderr,
+            )
+            print("LOCAL: " + str(saved))
+            return 0
+        try:
+            answer = input("Publish this report to insightharness.com? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            saved = _save_html_locally(html_bytes, report_path)
+            print(
+                "Cancelled. Your report is saved at " + str(saved) + ".",
+                file=sys.stderr,
+            )
+            print("LOCAL: " + str(saved))
+            return 0
+
+    try:
+        status, body, headers = post_report(html_bytes, token, opener=opener)
+    except urllib.error.URLError as e:
+        saved = _save_html_locally(html_bytes, report_path)
+        print(
+            "Network error reaching insightharness.com: " + str(e.reason)
+            + ". Your report is saved at " + str(saved) + ".",
+            file=sys.stderr,
+        )
+        print("LOCAL: " + str(saved))
+        return 2
+    except Exception as e:  # noqa: BLE001 — last-resort guard
+        saved = _save_html_locally(html_bytes, report_path)
+        print(
+            "Unexpected error during upload: " + str(e)
+            + ". Your report is saved at " + str(saved) + ".",
+            file=sys.stderr,
+        )
+        print("LOCAL: " + str(saved))
+        return 2
+
+    return handle_publish_response(status, body, headers, html_bytes, report_path)
+
+
+def build_arg_parser():
+    """argparse parser preserving the legacy hand-rolled flags + new ones.
+
+    Kept as a module-level function so test_publish.py can call it
+    directly without importing main().
+    """
+    parser = argparse.ArgumentParser(
+        prog="insight-harness",
+        description="Extract a Claude Code harness profile to HTML.",
+        # Preserve the prior "any argv position" feel — argparse already
+        # handles that for optional flags, but we add an explicit epilog
+        # so --help users see the publish flow.
+        epilog=(
+            "Without --publish, the final stdout line is the absolute path to "
+            "the dated HTML report. With --publish, the final stdout line is "
+            "RESULT: <edit-url>."
+        ),
+    )
+    # Legacy flags (preserved verbatim).
+    parser.add_argument(
+        "--update", action="store_true",
+        help="Print update instructions and exit. Auto-update is disabled.",
+    )
+    showcase = parser.add_mutually_exclusive_group()
+    showcase.add_argument(
+        "--include-skills", dest="include_skills", action="store_true",
+        default=True,
+        help="Ship per-skill README + hero data (default).",
+    )
+    showcase.add_argument(
+        "--no-include-skills", dest="include_skills", action="store_false",
+        help="Strip per-skill README + hero data from the report.",
+    )
+    # New publish flags.
+    parser.add_argument(
+        "--publish", action="store_true",
+        help="POST the generated HTML to insightharness.com after extraction.",
+    )
+    parser.add_argument(
+        "--token", default=None, metavar="TOKEN",
+        help="Save this ih_... token to ~/.claude/insight-harness/config.json. "
+             "Use with --publish to also publish on this run.",
+    )
+    parser.add_argument(
+        "--confirm", action="store_true",
+        help="Prompt [y/N] before uploading under --publish. Non-TTY = skip upload.",
+    )
+    return parser
+
+
 # ── Version Check & Self-Update ───────────────────────────────────────────
 
 def check_for_updates():
@@ -2901,18 +3295,53 @@ def self_update():
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
-def main():
-    # Accept --update in any argv position, not just argv[1]. Matches the
-    # ergonomics of --include-skills / --no-include-skills being positional-
-    # agnostic.
-    if "--update" in sys.argv[1:]:
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.update:
         self_update()
         sys.exit(0)
+
+    # --token without --publish (and without other inputs): just persist
+    # the token and exit. Validation happens up front so a malformed token
+    # never lands in config.json.
+    if args.token is not None and not args.publish:
+        try:
+            save_token_to_config(args.token)
+        except ValueError as e:
+            print("Invalid token: " + str(e), file=sys.stderr)
+            sys.exit(2)
+        print(
+            "Saved token to " + str(PUBLISH_CONFIG_PATH) + " (mode 0600).",
+            file=sys.stderr,
+        )
+        sys.exit(0)
+
+    # Resolve token for the publish flow before doing any expensive work.
+    publish_token = None
+    if args.publish:
+        if args.token is not None:
+            try:
+                save_token_to_config(args.token)
+            except ValueError as e:
+                print("Invalid token: " + str(e), file=sys.stderr)
+                sys.exit(2)
+            publish_token = args.token
+        else:
+            publish_token = load_token_from_config()
+            if publish_token is None:
+                print(
+                    "No token configured. Visit https://insightharness.com/upload "
+                    "to get one.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
 
     # Showcase data (per-skill README + hero) is default-on as of 2.6.0.
     # `--include-skills` remains as an explicit no-op for backward compat;
     # `--no-include-skills` opts out for users who want the smaller payload.
-    include_showcase = "--no-include-skills" not in sys.argv[1:]
+    include_showcase = args.include_skills
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS)
 
@@ -3104,9 +3533,22 @@ def main():
             counter += 1
         doc_path.write_text(html)
 
-    # Print the dated path — the log consumer (skill instructions) reads the
-    # last line as the canonical output location. The stable report.html still
-    # exists for predictable access.
+    if args.publish:
+        # Read the bytes we just wrote so post_report ships exactly what is
+        # on disk (and what the user can inspect at PUBLISH_REPORT_PATH on
+        # failure). Reading rather than re-encoding `html` avoids any
+        # surprise encoding drift between Path.write_text and our POST.
+        html_bytes = dated_path.read_bytes()
+        rc = publish_report(html_bytes, publish_token, confirm=args.confirm)
+        # Update check is best-effort — keep it on the publish path too
+        # so users who only ever --publish still get the nudge.
+        check_for_updates()
+        sys.exit(rc)
+
+    # Default contract (no --publish): print the dated path — the log
+    # consumer (skill instructions) reads the last line as the canonical
+    # output location. The stable report.html still exists for predictable
+    # access.
     print(str(dated_path))
 
     # Check for updates (non-blocking, silent on failure)
