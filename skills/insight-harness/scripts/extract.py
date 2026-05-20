@@ -3112,9 +3112,10 @@ def handle_publish_response(status, body, headers, html_bytes, report_path=None)
         # URL (see insightful PR #146), but if it ever ships a relative path again
         # — accidentally or in an older deployment — we prepend the publish base
         # URL so the printed/clipboarded URL is always directly clickable.
+        # Reuse publish_base_url() so empty-string env overrides behave the same
+        # here as in post_report() (falls through to the default, not literal "").
         if isinstance(edit_url, str) and edit_url.startswith("/"):
-            base = os.environ.get(PUBLISH_BASE_URL_ENV, PUBLISH_DEFAULT_BASE_URL).rstrip("/")
-            edit_url = base + edit_url
+            edit_url = publish_base_url().rstrip("/") + edit_url
         if not edit_url:
             saved = _save_html_locally(html_bytes, report_path)
             print(

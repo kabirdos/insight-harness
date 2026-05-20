@@ -253,6 +253,29 @@ class PublishReportTests(unittest.TestCase):
                 "RESULT: http://localhost:3000/insights/alice/abc123/edit",
             )
 
+    def test_200_with_relative_edit_url_falls_back_when_env_override_is_empty(self):
+        # Empty string in INSIGHT_HARNESS_BASE_URL must NOT produce an
+        # unqualified URL. publish_base_url() returns the default when
+        # the env override is empty, so the qualified result matches
+        # the default-base case.
+        body = json.dumps({"editUrl": "/insights/alice/abc123/edit"}).encode()
+        opener = lambda req, timeout=None: _fake_response(200, body=body)  # noqa: E731
+        with TemporaryDirectory() as d:
+            report = Path(d) / "report.html"
+            buf_out = io.StringIO()
+            with patch("extract.copy_to_clipboard", return_value=True), \
+                 patch.object(sys, "stdout", buf_out), \
+                 patch.dict(os.environ, {extract.PUBLISH_BASE_URL_ENV: ""}, clear=False):
+                rc = extract.publish_report(
+                    b"<html></html>", VALID_TOKEN,
+                    report_path=report, opener=opener,
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                buf_out.getvalue().strip().splitlines()[-1],
+                f"RESULT: {extract.PUBLISH_DEFAULT_BASE_URL.rstrip('/')}/insights/alice/abc123/edit",
+            )
+
     def test_401_saves_html_and_exits_2(self):
         opener = lambda req, timeout=None: _fake_response(401, body=b'{"error":"bad"}')  # noqa: E731
         with TemporaryDirectory() as d:
