@@ -202,6 +202,57 @@ class PublishReportTests(unittest.TestCase):
                 "RESULT: https://insightharness.com/edit/abc",
             )
 
+    def test_200_with_relative_edit_url_prepends_publish_base(self):
+        # Defensive: an older server (or a regression) might return a
+        # path-only editUrl like `/insights/u/s/edit`. The skill must
+        # prepend the publish base URL so the printed/clipboarded URL
+        # is always directly clickable. See insightful PR #146 for the
+        # canonical server-side fix.
+        body = json.dumps({"editUrl": "/insights/alice/abc123/edit"}).encode()
+        opener = lambda req, timeout=None: _fake_response(200, body=body)  # noqa: E731
+        with TemporaryDirectory() as d:
+            report = Path(d) / "report.html"
+            buf_out = io.StringIO()
+            with patch("extract.copy_to_clipboard", return_value=True), \
+                 patch.object(sys, "stdout", buf_out), \
+                 patch.dict(os.environ, {}, clear=False):
+                # Ensure no override env var is set so the default base
+                # URL is used.
+                os.environ.pop(extract.PUBLISH_BASE_URL_ENV, None)
+                rc = extract.publish_report(
+                    b"<html></html>", VALID_TOKEN,
+                    report_path=report, opener=opener,
+                )
+            self.assertEqual(rc, 0)
+            final_line = buf_out.getvalue().strip().splitlines()[-1]
+            self.assertEqual(
+                final_line,
+                f"RESULT: {extract.PUBLISH_DEFAULT_BASE_URL.rstrip('/')}/insights/alice/abc123/edit",
+            )
+
+    def test_200_with_relative_edit_url_uses_base_url_env_override(self):
+        # Same defensive behavior, but the dev override env var picks a
+        # different base URL (e.g. http://localhost:3000 for local
+        # smoke tests against a dev server).
+        body = json.dumps({"editUrl": "/insights/alice/abc123/edit"}).encode()
+        opener = lambda req, timeout=None: _fake_response(200, body=body)  # noqa: E731
+        with TemporaryDirectory() as d:
+            report = Path(d) / "report.html"
+            buf_out = io.StringIO()
+            with patch("extract.copy_to_clipboard", return_value=True), \
+                 patch.object(sys, "stdout", buf_out), \
+                 patch.dict(os.environ, {extract.PUBLISH_BASE_URL_ENV: "http://localhost:3000/"}, clear=False):
+                rc = extract.publish_report(
+                    b"<html></html>", VALID_TOKEN,
+                    report_path=report, opener=opener,
+                )
+            self.assertEqual(rc, 0)
+            # Trailing slash on the env var is stripped before joining.
+            self.assertEqual(
+                buf_out.getvalue().strip().splitlines()[-1],
+                "RESULT: http://localhost:3000/insights/alice/abc123/edit",
+            )
+
     def test_401_saves_html_and_exits_2(self):
         opener = lambda req, timeout=None: _fake_response(401, body=b'{"error":"bad"}')  # noqa: E731
         with TemporaryDirectory() as d:
