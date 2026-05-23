@@ -455,6 +455,12 @@ def extract_skill_inventory(include_showcase=False):
                 private_names.add(f"{source[len('plugin:'):]}:{name}")
             return
 
+        # Capture the directory/file stem — this is the name a skill is invoked
+        # by ("<plugin>:<dir>"), which can differ from the frontmatter `name`
+        # (e.g. dir "ce-brainstorm" vs name "ce:brainstorm"). build_skill_meta
+        # uses it to resolve namespaced invocations to this metadata.
+        meta.setdefault("_invocation_name", sp.parent.name if sp.stem == "SKILL" else sp.stem)
+
         if include_showcase:
             raw_readme = _read_raw_readme(sp)
             pending.append((meta, sp, source, raw_readme))
@@ -500,6 +506,34 @@ def extract_skill_inventory(include_showcase=False):
     skills_with_deny = _SkillInventoryList(skills)
     skills_with_deny.private_skill_names = private_names
     return skills_with_deny
+
+
+def build_skill_meta(skills):
+    """Index parsed skills for lookup by runtime invocation key.
+
+    Skills are invoked by the name passed to the Skill tool: bare ("ux-mockup")
+    for user/custom skills, namespaced ("compound-engineering:ce-brainstorm")
+    for plugin skills. But plugin skills are parsed with name=<bare-skill> and
+    source="plugin:<marketplace>/<plugin>", so a bare-name index never matches a
+    namespaced invocation — the join silently drops the description and the
+    install pointer. Register plugin skills under "<plugin>:<name>" too, where
+    <plugin> is the trailing segment of the source, so namespaced invocations
+    resolve to their metadata.
+    """
+    meta = {}
+    for s in skills:
+        meta.setdefault(s["name"], s)
+        src = s.get("source", "")
+        if src.startswith("plugin:"):
+            plugin = src.split("/")[-1]
+            if plugin:
+                # Runtime invokes plugin skills as "<plugin>:<dir>", which can
+                # differ from the frontmatter name — register both so either
+                # invocation form resolves.
+                for skill_key in (s.get("_invocation_name"), s["name"]):
+                    if skill_key:
+                        meta.setdefault(f"{plugin}:{skill_key}", s)
+    return meta
 
 
 class _SkillInventoryList(list):
@@ -2113,13 +2147,10 @@ def generate_html(data):
     def pct(part, total):
         return round(part / total * 100) if total > 0 else 0
 
-    # Build skill metadata lookup from inventory
-    skill_meta = {}
-    for s in skills:
-        skill_meta[s["name"]] = s
-        # Also index by full name for plugin skills like "compound-engineering:git-commit"
-        if ":" in s.get("name", ""):
-            skill_meta[s["name"]] = s
+    # Build skill metadata lookup from inventory. Indexes plugin skills under
+    # their namespaced invocation key so runtime invocations resolve to their
+    # description and install pointer instead of an empty entry.
+    skill_meta = build_skill_meta(skills)
 
     # Skill rows with source badge and description
     skill_rows_list = []
