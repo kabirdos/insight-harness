@@ -346,6 +346,34 @@ def _skill_md_body(skill_md_path):
     return text[end + 3:].lstrip("\n")
 
 
+def derive_description_from_body(markdown):
+    """Fallback description for skills with no frontmatter `description`.
+
+    Returns the first prose line of the skill body — skipping headings, blank
+    lines, and code fences, and stripping a leading blockquote/bullet marker.
+    Input must already be PII-scrubbed (we derive from the scrubbed
+    readme_markdown), so the result needs no further scrubbing.
+    """
+    if not markdown:
+        return ""
+    in_fence = False
+    for raw in markdown.splitlines():
+        line = raw.strip()
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not line or line.startswith("#"):
+            continue
+        if line.startswith(">"):
+            line = line.lstrip(">").strip()
+        elif line[:2] in ("- ", "* "):
+            line = line[2:].strip()
+        line = line.replace("**", "").replace("`", "").strip()
+        if line:
+            return line[:120]
+    return ""
+
+
 def _truncate_to_bytes(text, limit):
     """Truncate text to at most `limit` UTF-8 bytes, then append the marker."""
     encoded = text.encode("utf-8")
@@ -493,6 +521,11 @@ def extract_skill_inventory(include_showcase=False):
             meta["hero_mime_type"] = showcase["hero_mime_type"]
             meta["category"] = meta.get("category") or None
             meta["source"] = source
+            # Skills with no frontmatter description fall back to the first prose
+            # line of their (already-scrubbed) body so consumers and the skill
+            # table aren't left with a blank.
+            if not meta.get("description") and meta["readme_markdown"]:
+                meta["description"] = derive_description_from_body(meta["readme_markdown"])
             skills.append(meta)
 
     # Attach the deny-set to the list via a sentinel attribute. This is
