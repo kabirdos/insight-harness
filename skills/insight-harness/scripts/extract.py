@@ -785,6 +785,9 @@ KNOWN_AGENT_TOOLS = [
     ("Codex desktop", ("Library", "Application Support", "Codex")),
     ("Cursor", (".cursor",)),
     ("Claude desktop", ("Library", "Application Support", "Claude", "claude-code")),
+    ("Gemini CLI", (".gemini",)),
+    ("GitHub Copilot", (".copilot",)),
+    ("Factory", (".factory",)),
 ]
 
 
@@ -1646,35 +1649,6 @@ def extract_ide_integration():
     return {"mode": "terminal-only"}
 
 
-def extract_hybrid_tools():
-    """Detect cross-tool patterns (Gemini CLI, Codex, etc.)."""
-    tools_found = set()
-
-    # Check CLAUDE.md for tool references
-    for md_path in [CLAUDE_DIR / "CLAUDE.md"]:
-        if md_path.exists():
-            try:
-                text = md_path.read_text(encoding="utf-8", errors="replace").lower()
-                if "gemini" in text:
-                    tools_found.add("Gemini CLI")
-                if "codex" in text:
-                    tools_found.add("OpenAI Codex")
-                if "copilot" in text:
-                    tools_found.add("GitHub Copilot")
-                if "cursor" in text:
-                    tools_found.add("Cursor")
-            except IOError:
-                pass
-
-    # Check for other AI tool directories
-    if (Path.home() / ".codex").exists():
-        tools_found.add("OpenAI Codex")
-    if (Path.home() / ".factory").exists():
-        tools_found.add("Factory")
-
-    return {"tools": sorted(tools_found)}
-
-
 def extract_blocklist_issues():
     """Check for blocklist contradictions with enabled plugins."""
     settings = safe_json_load(CLAUDE_DIR / "settings.json") or {}
@@ -1824,7 +1798,6 @@ def generate_writeup(data):
     mkt = data.get("marketplace", {})
     statusline_info = data.get("statusline", {})
     ide_info = data.get("ide", {})
-    hybrid = data.get("hybrid_tools", {})
     blocklist_info = data.get("blocklist", {})
     perm_accum = data.get("perm_accumulation", {})
 
@@ -2152,7 +2125,6 @@ def generate_html(data):
     mkt = data.get("marketplace", {})
     statusline_info = data.get("statusline", {})
     ide_info = data.get("ide", {})
-    hybrid = data.get("hybrid_tools", {})
     blocklist_info = data.get("blocklist", {})
     perm_accum = data.get("perm_accumulation", {})
 
@@ -2969,7 +2941,6 @@ f'<div class="meta" style="margin-top:0.5rem">{jsonl.get("agent_background_pct",
     </div>
     {"<h3>Universal Deny Rules</h3><div class='tags'>" + "".join(f'<span class=\"tag\">{he(d)}</span>' for d in safety.get("universal_denies", [])) + "</div>" if safety.get("universal_denies") else ""}
     {"<h3>Experimental Features</h3><div class='tags'>" + "".join(f'<span class=\"tag\">{he(k)}: {he(v)}</span>' for k, v in experimental.get("experimental_flags", {}).items()) + "</div>" if experimental.get("experimental_flags") else ""}
-    {"<h3>Other AI Tools Detected</h3><div class='tags'>" + "".join(f'<span class=\"tag\">{he(t)}</span>' for t in hybrid.get("tools", [])) + "</div>" if hybrid.get("tools") else ""}
     {"<h3>Plugin Marketplaces (" + str(mkt.get("count", 0)) + ")</h3><div class='tags'>" + "".join(f'<span class=\"tag\">{he(m["name"])}</span>' for m in mkt.get("marketplaces", [])) + "</div>" if mkt.get("marketplaces") else ""}
 </section>
 
@@ -3614,9 +3585,6 @@ def main(argv=None):
     print("Checking IDE integration...", file=sys.stderr)
     ide = extract_ide_integration()
 
-    print("Detecting hybrid tools...", file=sys.stderr)
-    hybrid_tools = extract_hybrid_tools()
-
     print("Checking blocklist...", file=sys.stderr)
     blocklist = extract_blocklist_issues()
 
@@ -3645,7 +3613,6 @@ def main(argv=None):
         "marketplace": marketplace,
         "statusline": statusline,
         "ide": ide,
-        "hybrid_tools": hybrid_tools,
         "blocklist": blocklist,
         "perm_accumulation": perm_accumulation,
     }

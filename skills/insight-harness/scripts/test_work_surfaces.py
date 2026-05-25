@@ -83,6 +83,36 @@ class AgentToolPresenceTest(unittest.TestCase):
             else:
                 self.assertIsNone(entry["lastActive"])
 
+    def test_migrated_tools_detected_by_path(self):
+        # Tools that were previously only detectable via the now-removed
+        # extract_hybrid_tools() CLAUDE.md-text scan must still be covered by a
+        # real directory-presence check so consolidation does not regress.
+        with TemporaryDirectory() as d:
+            home = Path(d)
+            (home / ".gemini").mkdir()
+            (home / ".copilot").mkdir()
+            (home / ".factory").mkdir()
+            result = extract.detect_agent_tools(home=home)
+        by_tool = {t["tool"]: t for t in result}
+        self.assertTrue(by_tool["Gemini CLI"]["present"])
+        self.assertTrue(by_tool["GitHub Copilot"]["present"])
+        self.assertTrue(by_tool["Factory"]["present"])
+
+    def test_known_tool_list_covers_consolidated_set(self):
+        labels = {label for label, _ in extract.KNOWN_AGENT_TOOLS}
+        # Coverage from the old hybrid path (Codex, Cursor, Gemini, Copilot,
+        # Factory) plus the desktop surfaces must all be present.
+        for expected in (
+            "Codex CLI",
+            "Codex desktop",
+            "Cursor",
+            "Claude desktop",
+            "Gemini CLI",
+            "GitHub Copilot",
+            "Factory",
+        ):
+            self.assertIn(expected, labels)
+
     def test_absent_when_no_dirs(self):
         with TemporaryDirectory() as d:
             result = extract.detect_agent_tools(home=Path(d))
