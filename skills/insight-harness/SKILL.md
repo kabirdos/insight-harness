@@ -19,10 +19,11 @@ Runs a Python extraction script that reads harness metadata from:
 - `~/.claude/plugins/installed_plugins.json` (plugin inventory)
 - `~/.claude/skills/` (skill frontmatter for every skill; plus README.md + `assets/hero.{png,jpg}` by default for skills you've marked as shareable — see the "Skill showcase" section below)
 - `~/.claude/usage-data/session-meta/` (pre-computed session stats)
-- `~/.claude/projects/*/*.jsonl` (field-whitelisted: tool names, skill names, hook events, tool transition sequences, workflow phase classifications only)
+- `~/.claude/projects/*/*.jsonl` (field-whitelisted: tool names, skill names, hook events, tool transition sequences, workflow phase classifications, and the non-PII `entrypoint` enum field — e.g. `cli`/`sdk-cli` — only)
 - `~/.claude/projects/*/settings.local.json` (approved permissions)
+- Existence + last-modified time (NOT contents) of a small list of other agent-tool data directories — `~/.codex`, `~/.cursor`, `~/Library/Application Support/Codex`, `~/Library/Application Support/Claude/claude-code` — to populate the "Work Surfaces" section.
 
-**Privacy guarantee:** The script uses a strict field whitelist. It NEVER reads tool arguments, message text, tool results, file paths inside your projects, or any project-specific content. Real credentials exist in JSONL files — the script never touches those fields.
+**Privacy guarantee:** The script uses a strict field whitelist. It NEVER reads tool arguments, message text, tool results, file paths inside your projects, or any project-specific content. The one envelope field it reads beyond names/events is `entrypoint`, a non-PII enum (`cli`, `sdk-cli`, etc.) used for the Work Surfaces breakdown. Other agent tools are detected by directory presence and mtime only — their contents are never opened or read. Real credentials exist in JSONL files — the script never touches those fields.
 
 **Skill showcase data (default-on):** By default, the script also reads each shareable skill's `README.md` and hero image, scrubs PII from the README text (git name/email, OS username paths, GitHub URLs with your username, `@<you>` mentions), and ships the results. Skills with `repo: private` or `repo: none` in their SKILL.md frontmatter are excluded entirely — they never appear in the output, not even in invocation counts. See the "Skipping showcase content" section if you want to opt out of shipping README + hero data.
 
@@ -40,6 +41,7 @@ Everything from /insights, plus:
 - **Models used** — Opus, Sonnet, Haiku distribution
 - **Permission modes** — how you configure access
 - **MCP servers** — connected servers
+- **Work surfaces** — per-session Claude Code entrypoint breakdown (e.g. cli vs sdk-cli) plus coarse presence of other agent tools (Codex, Cursor, Claude desktop) detected by data-directory existence/mtime only
 - **Workflow phases** — classifies tool usage into phases (exploration, implementation, testing, shipping, orchestration) and shows the distribution across sessions
 - **Phase transitions** — tracks how you move between workflow phases (e.g., exploration -> implementation), with statistics on disciplined patterns like "test before ship"
 - **Tool transitions** — tracks sequential tool usage patterns within turns (e.g., Read -> Edit), showing your most common tool flows
