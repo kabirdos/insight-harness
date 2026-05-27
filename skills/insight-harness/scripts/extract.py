@@ -776,6 +776,63 @@ def compute_workflow_patterns(sequences, min_length=2, max_length=4, top_n=10):
     ]
 
 
+# Known agent-tool data directories, relative to the user's home. Presence is
+# detected by directory EXISTENCE and last-modified mtime ONLY — the contents
+# are never read, in keeping with the skill's privacy posture. Keep this list
+# small and easy to extend: (label, *relative path parts).
+KNOWN_AGENT_TOOLS = [
+    ("Codex CLI", (".codex",)),
+    ("Codex desktop", ("Library", "Application Support", "Codex")),
+    ("Cursor", (".cursor",)),
+    ("Claude desktop", ("Library", "Application Support", "Claude", "claude-code")),
+    ("Gemini CLI", (".gemini",)),
+    ("GitHub Copilot", (".copilot",)),
+    ("Factory", (".factory",)),
+]
+
+
+def detect_agent_tools(home=None):
+    """Coarsely detect other agent tools by data-directory presence.
+
+    Returns one entry per known tool so the list is stable across machines:
+        [{"tool": "Codex CLI", "present": True, "lastActive": "<iso>"}, ...]
+
+    PRIVACY: this only stats the directory (existence + mtime). It NEVER opens,
+    lists, or reads anything inside the directory.
+    """
+    base = Path(home) if home is not None else Path.home()
+    results = []
+    for label, parts in KNOWN_AGENT_TOOLS:
+        path = base.joinpath(*parts)
+        present = False
+        last_active = None
+        try:
+            if path.is_dir():
+                present = True
+                mtime = path.stat().st_mtime
+                last_active = datetime.fromtimestamp(
+                    mtime, tz=timezone.utc
+                ).isoformat()
+        except OSError:
+            pass
+        results.append({"tool": label, "present": present, "lastActive": last_active})
+    return results
+
+
+def dominant_entrypoint(counts):
+    """Return the dominant entrypoint for a single session.
+
+    `counts` maps entrypoint value -> per-line occurrence count within one
+    session/file. The dominant value is the mode; ties resolve alphabetically
+    so the aggregate is deterministic across runs. Returns None for an empty
+    session.
+    """
+    if not counts:
+        return None
+    # Sort by (-count, value): highest count first, then alphabetical on ties.
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+
 def extract_jsonl_metadata(cutoff):
     skill_invocations = Counter()
     session_skill_sequences = []  # list of per-session skill sequences
@@ -784,7 +841,10 @@ def extract_jsonl_metadata(cutoff):
     tool_usage = Counter()
     mcp_servers = Counter()
     permission_modes = Counter()
+    # Per-line entrypoint tally retained for backward compatibility; the
+    # primary signal is session_entrypoints (one dominant value per session).
     entrypoints = Counter()
+    session_entrypoints = Counter()  # dominant entrypoint counted once per session
     models = Counter()
     versions = Counter()
     cli_tools = Counter()
@@ -848,6 +908,7 @@ def extract_jsonl_metadata(cutoff):
             session_branches = set()
             session_phases_seen = []  # ordered list of phases for this session
             session_skills_seen = []  # ordered skill invocations for this session
+            session_entrypoint_counts = Counter()  # entrypoint tally for THIS file
 
             try:
                 with open(jsonl_file, "r", errors="replace") as f:
@@ -1009,9 +1070,13 @@ def extract_jsonl_metadata(cutoff):
                                         if item.get("is_error"):
                                             tool_errors += 1
 
+                        # PRIVACY: `entrypoint` is a non-PII enum surface field
+                        # (e.g. "cli", "sdk-cli", "vscode"). We read ONLY this
+                        # field, never message text/args/results/paths.
                         ep = d.get("entrypoint", "")
                         if ep:
                             entrypoints[ep] += 1
+                            session_entrypoint_counts[ep] += 1
                         ver = d.get("version", "")
                         if ver:
                             versions[ver] += 1
@@ -1021,6 +1086,12 @@ def extract_jsonl_metadata(cutoff):
 
             if session_had_data:
                 session_count += 1
+            # Attribute the whole session to its dominant entrypoint so the
+            # aggregate reads like "27 cli sessions, 2 sdk-cli" rather than
+            # raw per-line counts (which over-weight long sessions).
+            session_ep = dominant_entrypoint(session_entrypoint_counts)
+            if session_ep:
+                session_entrypoints[session_ep] += 1
             if session_phases_seen:
                 session_phase_sequences.append(session_phases_seen)
             if session_skills_seen:
@@ -1067,6 +1138,7 @@ def extract_jsonl_metadata(cutoff):
         "mcp_servers": dict(mcp_servers.most_common(20)),
         "permission_modes": dict(permission_modes),
         "entrypoints": dict(entrypoints.most_common(10)),
+        "session_entrypoints": dict(session_entrypoints.most_common(10)),
         "models": dict(models.most_common(10)),
         "versions": dict(versions.most_common(10)),
         "cli_tools": dict(cli_tools.most_common(20)),
@@ -1577,35 +1649,6 @@ def extract_ide_integration():
     return {"mode": "terminal-only"}
 
 
-def extract_hybrid_tools():
-    """Detect cross-tool patterns (Gemini CLI, Codex, etc.)."""
-    tools_found = set()
-
-    # Check CLAUDE.md for tool references
-    for md_path in [CLAUDE_DIR / "CLAUDE.md"]:
-        if md_path.exists():
-            try:
-                text = md_path.read_text(encoding="utf-8", errors="replace").lower()
-                if "gemini" in text:
-                    tools_found.add("Gemini CLI")
-                if "codex" in text:
-                    tools_found.add("OpenAI Codex")
-                if "copilot" in text:
-                    tools_found.add("GitHub Copilot")
-                if "cursor" in text:
-                    tools_found.add("Cursor")
-            except IOError:
-                pass
-
-    # Check for other AI tool directories
-    if (Path.home() / ".codex").exists():
-        tools_found.add("OpenAI Codex")
-    if (Path.home() / ".factory").exists():
-        tools_found.add("Factory")
-
-    return {"tools": sorted(tools_found)}
-
-
 def extract_blocklist_issues():
     """Check for blocklist contradictions with enabled plugins."""
     settings = safe_json_load(CLAUDE_DIR / "settings.json") or {}
@@ -1755,7 +1798,6 @@ def generate_writeup(data):
     mkt = data.get("marketplace", {})
     statusline_info = data.get("statusline", {})
     ide_info = data.get("ide", {})
-    hybrid = data.get("hybrid_tools", {})
     blocklist_info = data.get("blocklist", {})
     perm_accum = data.get("perm_accumulation", {})
 
@@ -2083,7 +2125,6 @@ def generate_html(data):
     mkt = data.get("marketplace", {})
     statusline_info = data.get("statusline", {})
     ide_info = data.get("ide", {})
-    hybrid = data.get("hybrid_tools", {})
     blocklist_info = data.get("blocklist", {})
     perm_accum = data.get("perm_accumulation", {})
 
@@ -2126,6 +2167,15 @@ def generate_html(data):
     phase_transitions = jsonl.get("phase_transitions", {})
     phase_distribution = jsonl.get("phase_distribution", {})
     phase_stats = jsonl.get("phase_stats", {})
+
+    # Work Surfaces signal: where Claude Code ran (per-session entrypoint
+    # breakdown) and which other agent tools are present on the machine.
+    session_entrypoints = jsonl.get("session_entrypoints", {})
+    agent_tools = jsonl.get("agent_tools", [])
+    _work_surfaces = {
+        "entrypoints": dict(session_entrypoints),
+        "agentTools": agent_tools,
+    }
 
     # File operation ratios
     reads = tool_counts.get("Read", 0)
@@ -2292,6 +2342,35 @@ def generate_html(data):
     version_tags = "".join(
         f'<span class="tag">{he(v)}</span>' for v, _ in sorted(jsonl.get("versions", {}).items(), key=lambda x: x[1], reverse=True)[:5]
     )
+
+    # ── Work Surfaces fragments ────────────────────────────────────────────
+    # Entrypoint breakdown: one count per session (dominant entrypoint).
+    if session_entrypoints:
+        ws_entry_html = "".join(
+            f'<div class="bar-row"><div class="bar-label">{he(name)}</div>'
+            f'<div class="bar-value">{fmt(count)} '
+            f'session{"s" if count != 1 else ""}</div></div>'
+            for name, count in sorted(
+                session_entrypoints.items(), key=lambda x: x[1], reverse=True
+            )
+        )
+    else:
+        ws_entry_html = '<p class="empty">No session data</p>'
+
+    # Other agent tools: presence-only badges (existence/mtime, never contents).
+    ws_present = [t for t in agent_tools if t.get("present")]
+    if ws_present:
+        ws_tool_html = "".join(
+            (
+                f'<span class="tag" title="last active {he(t["lastActive"][:10])}">'
+                f'{he(t["tool"])}</span>'
+                if t.get("lastActive")
+                else f'<span class="tag">{he(t["tool"])}</span>'
+            )
+            for t in ws_present
+        )
+    else:
+        ws_tool_html = '<span class="empty">No other agent tools detected</span>'
 
     # Harness files
     hf = harness_files
@@ -2460,6 +2539,7 @@ def generate_html(data):
             "errorRate": f'{jsonl.get("error_rate_pct", 0)}%',
         },
         "featurePills": _feature_pills,
+        "workSurfaces": _work_surfaces,
         "toolUsage": dict(tool_counts),
         "skillInventory": _skill_inventory_json,
         "hookDefinitions": _hook_defs_json,
@@ -2787,6 +2867,16 @@ f'<div class="meta" style="margin-top:0.5rem">{jsonl.get("agent_background_pct",
     {make_bar_chart(dict(tool_counts.most_common(15)), "var(--accent)")}
 </section>
 
+<!-- Work Surfaces -->
+<section>
+    <div class="section-header"><h2>Work Surfaces</h2><span class="count">{sum(session_entrypoints.values())} sessions</span></div>
+    <h3>Claude Code Entrypoints</h3>
+    {ws_entry_html}
+    <h3>Other Agent Tools</h3>
+    <p class="meta">Detected by data-directory presence only — contents are never read.</p>
+    <div class="tags">{ws_tool_html}</div>
+</section>
+
 <div class="two-col">
 <section>
     <div class="section-header"><h2>Languages</h2></div>
@@ -2851,7 +2941,6 @@ f'<div class="meta" style="margin-top:0.5rem">{jsonl.get("agent_background_pct",
     </div>
     {"<h3>Universal Deny Rules</h3><div class='tags'>" + "".join(f'<span class=\"tag\">{he(d)}</span>' for d in safety.get("universal_denies", [])) + "</div>" if safety.get("universal_denies") else ""}
     {"<h3>Experimental Features</h3><div class='tags'>" + "".join(f'<span class=\"tag\">{he(k)}: {he(v)}</span>' for k, v in experimental.get("experimental_flags", {}).items()) + "</div>" if experimental.get("experimental_flags") else ""}
-    {"<h3>Other AI Tools Detected</h3><div class='tags'>" + "".join(f'<span class=\"tag\">{he(t)}</span>' for t in hybrid.get("tools", [])) + "</div>" if hybrid.get("tools") else ""}
     {"<h3>Plugin Marketplaces (" + str(mkt.get("count", 0)) + ")</h3><div class='tags'>" + "".join(f'<span class=\"tag\">{he(m["name"])}</span>' for m in mkt.get("marketplaces", [])) + "</div>" if mkt.get("marketplaces") else ""}
 </section>
 
@@ -3437,6 +3526,11 @@ def main(argv=None):
     print("Scanning JSONL (field-whitelisted)...", file=sys.stderr)
     jsonl_metadata = extract_jsonl_metadata(cutoff)
 
+    # Work Surfaces: coarse presence-only detection of other agent tools.
+    # Directory existence + mtime ONLY — never reads their contents.
+    print("Detecting agent-tool surfaces...", file=sys.stderr)
+    jsonl_metadata["agent_tools"] = detect_agent_tools()
+
     # Privacy: drop call counts for skills marked repo: private/none. Filtering
     # at the data-source level (jsonl_metadata) — not just inside generate_html
     # — ensures generate_writeup() and any other downstream consumer also sees
@@ -3491,9 +3585,6 @@ def main(argv=None):
     print("Checking IDE integration...", file=sys.stderr)
     ide = extract_ide_integration()
 
-    print("Detecting hybrid tools...", file=sys.stderr)
-    hybrid_tools = extract_hybrid_tools()
-
     print("Checking blocklist...", file=sys.stderr)
     blocklist = extract_blocklist_issues()
 
@@ -3522,7 +3613,6 @@ def main(argv=None):
         "marketplace": marketplace,
         "statusline": statusline,
         "ide": ide,
-        "hybrid_tools": hybrid_tools,
         "blocklist": blocklist,
         "perm_accumulation": perm_accumulation,
     }

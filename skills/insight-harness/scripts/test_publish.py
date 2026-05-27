@@ -426,7 +426,6 @@ class MainWiringTests(unittest.TestCase):
                 patch("extract.extract_marketplace_diversity", return_value={}),
                 patch("extract.extract_statusline", return_value={}),
                 patch("extract.extract_ide_integration", return_value={}),
-                patch("extract.extract_hybrid_tools", return_value={}),
                 patch("extract.extract_blocklist_issues", return_value={}),
                 patch("extract.extract_permission_accumulation", return_value={}),
                 patch("extract.compute_throughput_total_tokens", return_value=0),
