@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import tomllib
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -297,6 +299,187 @@ def _empty_rollout_result() -> dict:
         "first_session": None,
         "last_session": None,
     }
+
+
+# --- Skill inventory (Unit 3) ------------------------------------------------
+# Codex stores user-level skills as ``~/.codex/skills/<name>/SKILL.md`` (verified
+# against the real tree). Unlike the Claude extractor there is no plugin-skill
+# cache walk and no flat ``*.md`` commands dir here — Codex plugins are declared
+# in config.toml (see ``extract_plugins_from_config``), not on disk as skills.
+#
+# D4 — INVENTORY ONLY: Codex loads skills into context; there is no reliable
+# per-skill invocation signal the way Claude's session logs carry Skill-tool
+# calls. So we emit ONLY ``{name, description, installPointer}`` and deliberately
+# attach NO ``calls`` / usage-count field. The Claude ``extract_skill_inventory``
+# is ``SKILLS_DIR``-coupled and also threads runtime call counts; we mirror its
+# two-pass owner-aware scrub structure but reimplement the walk for Codex roots.
+#
+# The two-pass approach (collect raw READMEs → build owner-aware scrub rules from
+# the whole corpus → finalize) is load-bearing for privacy: a third-party skill
+# whose README links ``github.com/<upstream-owner>/...`` must have that owner
+# scrubbed to a placeholder even though it never matches the local OS username,
+# and the LOCAL identity must NOT be injected in place of the upstream owner.
+
+
+# Known token PREFIXES (R7 tier-a). ``pii_scrub`` is identity-only — it does NOT
+# strip credentials — so a README that embeds a live token would otherwise carry
+# it straight into the emitted skill excerpt. The full two-tier emit gate is
+# Unit 6's job over the serialized profile; here we apply the unambiguous-prefix
+# redaction directly to the README excerpt the inventory emits so a third-party
+# README can never leak a credential through the showcase pipeline.
+_KNOWN_SECRET_RE = re.compile(
+    r"(?:Bearer\s+)?(?:sk-|ghp_|AKIA)[A-Za-z0-9_\-]+"
+)
+_SECRET_PLACEHOLDER = "<redacted-secret>"
+
+
+def _redact_known_secrets(text: str | None) -> str | None:
+    """Replace unambiguous token shapes (``sk-``/``Bearer ``/``ghp_``/``AKIA``)
+    in a free-text excerpt with a placeholder. Identity scrubbing (``pii_scrub``)
+    does not cover credentials, so this is the credential backstop for emitted
+    README text. Returns the input unchanged when there is nothing to redact."""
+    if not text:
+        return text
+    return _KNOWN_SECRET_RE.sub(_SECRET_PLACEHOLDER, text)
+
+
+def extract_skill_inventory_codex(include_showcase: bool = True) -> list[dict]:
+    """Walk Codex user skills and return an inventory-only list.
+
+    Returns a list of ``{name, description, installPointer}`` dicts. NO ``calls``
+    or usage-count field is emitted (D4 — Codex has no reliable invocation
+    signal). Skills whose frontmatter declares ``repo: private`` or ``repo: none``
+    are excluded ENTIRELY (not even listed), exactly as the Claude extractor
+    treats them.
+
+    When ``include_showcase`` is True, performs the Claude-style two-pass scrub:
+      1. Pre-scan: read every candidate README raw (unscrubbed).
+      2. Build owner-aware scrub rules from the concatenated corpus so any
+         ``github.com/<owner>/`` owner is scrubbed even when it differs from the
+         local OS username (no mis-attribution rewrite to the local identity).
+      3. Finalize: scrub + hero + per-skill cap; body-derive a blank description.
+
+    Reads ``CODEX_SKILLS_DIR`` at call time so a test ``patch.object`` is honored.
+    """
+    skills_dir = CODEX_SKILLS_DIR
+    if not skills_dir.exists():
+        return []
+
+    skills: list[dict] = []
+    # (meta, skill_md_path, raw_readme) staged for the second (scrub) pass.
+    pending: list[tuple[dict, Path, str]] = []
+
+    def _stage(meta, sp):
+        if not meta:
+            return
+        # Privacy: repo: private/none excludes the skill entirely — it is never
+        # listed (mirrors the Claude extractor's hard exclusion). Inventory-only
+        # output has no runtime-call pathway to re-leak it through.
+        repo = (meta.get("repo") or "").strip().lower()
+        if repo in ("private", "none"):
+            return
+        # The install pointer for a Codex user skill is its directory name (the
+        # name a user would `codex skills add`/reference it by). Codex has no
+        # plugin-skill cache, so there is no namespaced "<plugin>:<skill>" form.
+        install_pointer = sp.parent.name if sp.stem == "SKILL" else sp.stem
+        if include_showcase:
+            pending.append((meta, sp, _read_raw_readme(sp)))
+        else:
+            skills.append(_inventory_entry(meta, install_pointer))
+
+    for sp in sorted(skills_dir.glob("*/SKILL.md")):
+        _stage(parse_skill_frontmatter(sp), sp)
+
+    if include_showcase:
+        # Owner-aware rules built from the FULL corpus (so a third-party owner in
+        # any one README is scrubbed everywhere, and the local identity is never
+        # substituted in for an upstream owner).
+        combined = "\n".join(raw or "" for _, _, raw in pending)
+        scrub_rules = detect_pii(content_for_owner_scan=combined)
+        for meta, sp, raw_readme in pending:
+            install_pointer = sp.parent.name if sp.stem == "SKILL" else sp.stem
+            showcase = _finalize_showcase(raw_readme, sp, scrub_rules)
+            # Identity scrub happened inside _finalize_showcase; layer the
+            # credential redaction on top (pii_scrub is identity-only, R7).
+            readme_md = _redact_known_secrets(showcase["readme_markdown"])
+            entry = _inventory_entry(meta, install_pointer)
+            # Blank frontmatter description → body-derive from the scrubbed body.
+            if not entry["description"] and readme_md:
+                entry["description"] = derive_description_from_body(readme_md)
+            entry["readmeMarkdown"] = readme_md
+            entry["heroBase64"] = showcase["hero_base64"]
+            entry["heroMimeType"] = showcase["hero_mime_type"]
+            skills.append(entry)
+
+    return skills
+
+
+def _inventory_entry(meta: dict, install_pointer: str) -> dict:
+    """Build the inventory-only entry: name, description, installPointer.
+
+    Deliberately omits any ``calls`` / usage-count field (D4). The name falls
+    back to the install pointer (directory stem) when frontmatter omits it.
+    """
+    return {
+        "name": meta.get("name") or install_pointer,
+        "description": meta.get("description") or "",
+        "installPointer": install_pointer,
+    }
+
+
+# --- Plugins from config.toml (Unit 3, R10) ----------------------------------
+# Codex's plugin model is config-declared, NOT a ``~/.codex/plugins`` dir walk.
+# The real config.toml uses quoted, marketplace-qualified section keys:
+#   [plugins."github@openai-curated"]
+#   enabled = true
+# We emit ``{name, enabled}`` where ``name`` is the section key (the part inside
+# the quotes, e.g. ``github@openai-curated``) and ``enabled`` is the boolean
+# beneath it (defaulting to False when absent). We never read marketplace source
+# paths, connector UUIDs, or any other config section here.
+
+
+def _load_config_toml() -> dict:
+    """Parse ``CODEX_CONFIG_PATH`` (TOML) into a dict, or {} on any failure.
+
+    Python 3.11+ ships ``tomllib`` in the stdlib; this repo targets 3.14, so no
+    third-party TOML dependency is needed. Read at call time so test patches of
+    ``CODEX_CONFIG_PATH`` are honored.
+    """
+    path = CODEX_CONFIG_PATH
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def extract_plugins_from_config() -> list[dict]:
+    """Return the Codex plugin inventory from config.toml ``[plugins.*]`` (R10).
+
+    Each entry is ``{name, enabled}``. ``name`` is the plugin section key (e.g.
+    ``github@openai-curated``); ``enabled`` is the boolean under it (False when
+    absent or non-boolean). Sourced from config — not a directory walk — because
+    Codex declares plugins in config.toml. Returns [] when there is no config or
+    no ``[plugins]`` table.
+    """
+    config = _load_config_toml()
+    plugins_table = config.get("plugins")
+    if not isinstance(plugins_table, dict):
+        return []
+
+    entries: list[dict] = []
+    for name, body in plugins_table.items():
+        enabled = False
+        if isinstance(body, dict):
+            raw = body.get("enabled")
+            if isinstance(raw, bool):
+                enabled = raw
+        entries.append({"name": name, "enabled": enabled})
+    # Stable order so output is deterministic across runs.
+    entries.sort(key=lambda e: e["name"])
+    return entries
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

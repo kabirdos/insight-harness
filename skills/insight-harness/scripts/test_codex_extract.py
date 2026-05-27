@@ -428,5 +428,234 @@ class RolloutPrivacyGuardTest(unittest.TestCase):
             self.assertNotIn(forbidden, blob)
 
 
+def _write_skill(skills_dir: Path, name: str, frontmatter: str, body: str = "") -> Path:
+    """Create ``skills/<name>/SKILL.md`` under ``skills_dir`` and return its path.
+
+    ``frontmatter`` is the YAML between the ``---`` fences (no fences); ``body``
+    is the markdown after the closing fence.
+    """
+    sk = skills_dir / name
+    sk.mkdir(parents=True, exist_ok=True)
+    md = sk / "SKILL.md"
+    md.write_text(f"---\n{frontmatter}\n---\n\n{body}\n", encoding="utf-8")
+    return md
+
+
+class CodexSkillInventoryTest(unittest.TestCase):
+    """Unit 3 — Codex skills are INVENTORY ONLY: name, description,
+    installPointer. NO ``calls`` / usage-count field (D4 — Codex loads skills
+    into context; there is no reliable invocation signal)."""
+
+    def test_happy_path_three_skills_listed_with_descriptions_no_counts(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            skills_dir = root / "skills"
+            _write_skill(skills_dir, "alpha", "name: alpha\ndescription: Does alpha things.")
+            _write_skill(skills_dir, "beta", "name: beta\ndescription: Does beta things.")
+            _write_skill(skills_dir, "gamma", "name: gamma\ndescription: Does gamma things.")
+            with patch.object(codex_extract, "CODEX_SKILLS_DIR", skills_dir):
+                inv = codex_extract.extract_skill_inventory_codex()
+
+        names = sorted(e["name"] for e in inv)
+        self.assertEqual(names, ["alpha", "beta", "gamma"])
+        by_name = {e["name"]: e for e in inv}
+        self.assertEqual(by_name["alpha"]["description"], "Does alpha things.")
+        self.assertEqual(by_name["beta"]["installPointer"], "beta")
+        # CRITICAL (D4): no entry may carry a calls/usage-count field.
+        for e in inv:
+            for forbidden in ("calls", "count", "invocations", "usage", "usageCount"):
+                self.assertNotIn(
+                    forbidden, e,
+                    f"inventory entry must not carry a {forbidden!r} field: {e!r}",
+                )
+
+    def test_blank_frontmatter_description_is_body_derived(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            skills_dir = root / "skills"
+            # No description in frontmatter → first prose line of the body.
+            _write_skill(
+                skills_dir, "myskill", "name: myskill",
+                body="# My Skill\n\nDoes a specific useful thing for testing.",
+            )
+            with patch.object(codex_extract, "CODEX_SKILLS_DIR", skills_dir):
+                inv = codex_extract.extract_skill_inventory_codex()
+
+        entry = next(e for e in inv if e["name"] == "myskill")
+        self.assertEqual(entry["description"], "Does a specific useful thing for testing.")
+
+    def test_repo_private_skill_excluded_entirely(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            skills_dir = root / "skills"
+            _write_skill(skills_dir, "public-one", "name: public-one\ndescription: Visible.")
+            _write_skill(skills_dir, "secret-one", "name: secret-one\ndescription: Hidden.\nrepo: private")
+            _write_skill(skills_dir, "none-one", "name: none-one\ndescription: Also hidden.\nrepo: none")
+            with patch.object(codex_extract, "CODEX_SKILLS_DIR", skills_dir):
+                inv = codex_extract.extract_skill_inventory_codex()
+
+        names = [e["name"] for e in inv]
+        self.assertIn("public-one", names)
+        # repo: private / none → excluded entirely (not listed at all).
+        self.assertNotIn("secret-one", names)
+        self.assertNotIn("none-one", names)
+        # And the private skill's metadata never leaks anywhere in the output.
+        blob = json.dumps(inv)
+        self.assertNotIn("secret-one", blob)
+        self.assertNotIn("Hidden.", blob)
+
+    def test_no_include_skills_still_inventory_only(self):
+        # Even without the showcase pass the entries are inventory-only (no
+        # calls) and private skills stay excluded.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            skills_dir = root / "skills"
+            _write_skill(skills_dir, "alpha", "name: alpha\ndescription: A.")
+            _write_skill(skills_dir, "secret", "name: secret\ndescription: S.\nrepo: private")
+            with patch.object(codex_extract, "CODEX_SKILLS_DIR", skills_dir):
+                inv = codex_extract.extract_skill_inventory_codex(include_showcase=False)
+        names = [e["name"] for e in inv]
+        self.assertEqual(names, ["alpha"])
+        self.assertNotIn("calls", inv[0])
+
+    def test_absent_skills_dir_is_clean(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"  # skills/ deliberately absent
+            with patch.object(codex_extract, "CODEX_SKILLS_DIR", root / "skills"):
+                inv = codex_extract.extract_skill_inventory_codex()
+        self.assertEqual(inv, [])
+
+
+class CodexThirdPartyReadmeScrubTest(unittest.TestCase):
+    """SEC-10 (made concrete) — a third-party-owned README whose
+    ``github.com/<upstream-owner>/...`` URL differs from the local git identity:
+    (1) the local user's identity is NOT injected in place of the upstream owner
+    (no mis-attribution rewrite), and (2) the emitted excerpt contains neither
+    the local OS-username nor any ``sk-``/``Bearer `` token."""
+
+    def test_third_party_readme_no_misattribution_no_secret_leak(self):
+        upstream_owner = "anthropics"  # an org that is NOT the local user
+        local_user = "craig-local-fake-1234"
+        readme = (
+            "# Toolkit\n\n"
+            "Clone from https://github.com/anthropics/skilltools and run it.\n\n"
+            f"Local path: /Users/{local_user}/work/toolkit\n\n"
+            "Set the header `Authorization: Bearer sk-FAKE-THIRD-PARTY-999`.\n"
+        )
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            skills_dir = root / "skills"
+            sk = skills_dir / "third-party-tool"
+            sk.mkdir(parents=True)
+            (sk / "SKILL.md").write_text(
+                "---\nname: third-party-tool\ndescription: Wraps an upstream toolkit.\n---\n\nSee README.\n",
+                encoding="utf-8",
+            )
+            (sk / "README.md").write_text(readme, encoding="utf-8")
+
+            # Force a deterministic local identity so the assertion is hermetic:
+            # USER drives _local_username(); empty git config so only the
+            # owner-scan + username path rules apply.
+            with patch.object(codex_extract, "CODEX_SKILLS_DIR", skills_dir), \
+                 patch.dict("os.environ", {"USER": local_user}, clear=False), \
+                 patch("pii_scrub._git_config", return_value=""):
+                inv = codex_extract.extract_skill_inventory_codex()
+
+        entry = next(e for e in inv if e["name"] == "third-party-tool")
+        excerpt = entry.get("readmeMarkdown") or ""
+        self.assertTrue(excerpt, "expected a scrubbed README excerpt to be emitted")
+
+        # (1) No mis-attribution: the upstream owner is replaced with the generic
+        # placeholder, and the LOCAL identity is NOT substituted in its place.
+        self.assertIn("github.com/<your-username>/skilltools", excerpt)
+        self.assertNotIn(f"github.com/{local_user}/", excerpt)
+        # The upstream owner is scrubbed to a placeholder, not left verbatim and
+        # not rewritten to the local user.
+        self.assertNotIn(f"github.com/{upstream_owner}/", excerpt)
+
+        # (2) Neither the local OS-username nor any sk-/Bearer token survives.
+        self.assertNotIn(local_user, excerpt)
+        self.assertNotIn("sk-FAKE-THIRD-PARTY-999", excerpt)
+        self.assertNotIn("Bearer sk-", excerpt)
+        # The local home path is collapsed to ~ (username scrubbed out).
+        self.assertNotIn(f"/Users/{local_user}", excerpt)
+
+
+class CodexPluginsFromConfigTest(unittest.TestCase):
+    """Unit 3 / R10 — plugins are sourced from config.toml ``[plugins.*]``
+    (name + enabled), NOT a directory walk. Real config keys are quoted and
+    marketplace-qualified: ``[plugins."github@openai-curated"]``."""
+
+    def test_plugins_read_from_config_with_enabled_flags(self):
+        config = (
+            'model = "gpt-5.5"\n'
+            'approvals_reviewer = "user"\n\n'
+            '[plugins."github@openai-curated"]\n'
+            'enabled = true\n\n'
+            '[plugins."slack@openai-curated"]\n'
+            'enabled = false\n\n'
+            '[plugins."granola@openai-curated"]\n'
+            'enabled = true\n\n'
+            # A non-plugin section must not bleed into the plugin list.
+            '[projects."/Users/somebody/secret-project"]\n'
+            'trust_level = "trusted"\n'
+        )
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            root.mkdir(parents=True)
+            (root / "config.toml").write_text(config, encoding="utf-8")
+            with patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                plugins = codex_extract.extract_plugins_from_config()
+
+        by_name = {p["name"]: p for p in plugins}
+        self.assertEqual(
+            sorted(by_name),
+            ["github@openai-curated", "granola@openai-curated", "slack@openai-curated"],
+        )
+        self.assertTrue(by_name["github@openai-curated"]["enabled"])
+        self.assertFalse(by_name["slack@openai-curated"]["enabled"])
+        self.assertTrue(by_name["granola@openai-curated"]["enabled"])
+        # Each entry is {name, enabled} only — no other config detail bleeds in.
+        for p in plugins:
+            self.assertEqual(set(p), {"name", "enabled"})
+        # The project-path section key must never appear in the plugin output.
+        blob = json.dumps(plugins)
+        self.assertNotIn("secret-project", blob)
+        self.assertNotIn("/Users/somebody", blob)
+
+    def test_plugin_missing_enabled_defaults_false(self):
+        config = '[plugins."mystery@somewhere"]\n# no enabled key\n'
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            root.mkdir(parents=True)
+            (root / "config.toml").write_text(config, encoding="utf-8")
+            with patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                plugins = codex_extract.extract_plugins_from_config()
+        self.assertEqual(plugins, [{"name": "mystery@somewhere", "enabled": False}])
+
+    def test_no_config_or_no_plugins_table_is_empty(self):
+        # Absent config.toml.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            root.mkdir(parents=True)
+            with patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                self.assertEqual(codex_extract.extract_plugins_from_config(), [])
+        # Present config.toml with no [plugins] table.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            root.mkdir(parents=True)
+            (root / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+            with patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                self.assertEqual(codex_extract.extract_plugins_from_config(), [])
+
+    def test_malformed_toml_does_not_crash(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            root.mkdir(parents=True)
+            (root / "config.toml").write_text("this is = not [valid toml\n", encoding="utf-8")
+            with patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                self.assertEqual(codex_extract.extract_plugins_from_config(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
