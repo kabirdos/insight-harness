@@ -27,7 +27,9 @@ path-/shape-coupled parts are reimplemented for Codex's real data shapes.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -65,6 +67,236 @@ CODEX_VERSION_PATH = CODEX_DIR / "version.json"
 CODEX_USAGE_DATA_DIR = CODEX_DIR / "usage-data"
 
 VERSION = "0.1.0"  # Phase 1 scaffold — bump as units land.
+
+
+# --- Rollout parsing (Unit 2) ------------------------------------------------
+# Codex stores each session as one ``rollout-<ts>-<id>.jsonl`` under
+# ``sessions/YYYY/MM/DD/`` (verified against real ~/.codex). Two on-disk shapes
+# coexist (R9):
+#   * 2026 "payload envelope":  {"timestamp", "type", "payload": {"type", ...}}
+#   * 2025 "legacy flat":       {"timestamp", "type", ...}  (no payload, no
+#                                token_count records)
+# Every file counts as ONE session toward session_count + timespan regardless of
+# format; token / tool detail is read ONLY from the payload-envelope shape.
+#
+# POSITIVE read-allowlist (R5): the ONLY fields ever read off a record are
+#   - the envelope ``timestamp`` (for timespan),
+#   - ``payload.type`` (to route),
+#   - ``payload.info.total_token_usage.total_tokens`` on token_count records,
+#   - the unwrapped inner command BINARY (first token only) on shell calls.
+# Content carriers are never touched: message.content, reasoning.*,
+# agent_message.message, task_complete.last_agent_message, update_plan,
+# spawn_agent.message, *_output.output, apply_patch.*, web_search_call.action,
+# session_meta instruction/nickname/summary/git fields, text, thread_name,
+# user_message. Nothing else is read, so they cannot leak by construction.
+
+# Shell-runner wrappers to strip so we classify the INNER command, not the
+# runner. A leading runner followed by a -c/-lc flag means "run this string".
+_SHELL_RUNNERS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+_RUNNER_FLAGS = {"-c", "-lc", "-ic", "-l"}
+
+
+def _unwrap_command(arguments: str):
+    """Return the first-token command name for ONE function_call's arguments.
+
+    ``arguments`` is a JSON string. Two real shapes (verified against ~/.codex):
+      * ``shell``        -> {"command": ["bash", "-lc", "<full cmd>"], ...}
+      * ``exec_command`` -> {"cmd": "<full cmd string>", ...}
+
+    For the list shape we strip a leading shell-runner wrapper (``bash``/``sh``/
+    ``zsh`` ... followed by ``-lc``/``-c``) and feed the inner command STRING to
+    the reused ``extract_safe_command_name`` normalizer. For the string shape we
+    feed it directly. Either way we return ONLY the first program token (e.g.
+    ``curl``), never the full command — the secret-bearing arg yields ``curl``
+    and the ``sk-...`` token never escapes this function.
+    """
+    if not arguments:
+        return None
+    try:
+        args = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(args, dict):
+        return None
+
+    command = args.get("command")
+    inner = None
+    if isinstance(command, list):
+        toks = [t for t in command if isinstance(t, str)]
+        # Strip a leading "<runner> <flag>" wrapper so we read the real command.
+        if (
+            len(toks) >= 3
+            and toks[0] in _SHELL_RUNNERS
+            and toks[1] in _RUNNER_FLAGS
+        ):
+            inner = toks[2]
+        elif toks:
+            # Bare argv list (no shell wrapper): the binary is the first token.
+            inner = toks[0]
+    elif isinstance(command, str):
+        inner = command
+    elif isinstance(args.get("cmd"), str):
+        # exec_command shape: a raw command string under "cmd".
+        inner = args["cmd"]
+
+    if not inner:
+        return None
+    # extract_safe_command_name returns ONLY the program name (plus a strict
+    # node test-runner second token), never an arbitrary argument.
+    return extract_safe_command_name(inner)
+
+
+def _parse_envelope_timestamp(value):
+    """Parse a rollout envelope timestamp into a naive ISO datetime, or None.
+
+    Codex writes RFC3339 with a trailing ``Z``; ``fromisoformat`` on older
+    Pythons rejects ``Z``, so normalize it. Timestamps are compared/sorted as
+    strings downstream after normalizing to ``isoformat(timespec="seconds")``.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    raw = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    # Drop tz so first/last render uniformly; Codex sessions are wall-clock.
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
+
+
+def parse_rollouts(cutoff: datetime | None = None) -> dict:
+    """Parse every Codex rollout under ``CODEX_SESSIONS_DIR`` (recursively).
+
+    Returns a privacy-safe aggregate dict:
+      ``session_count``      every rollout file (both formats) counts as one.
+      ``total_tokens``       SUM over sessions of each session's MAX cumulative
+                             ``total_tokens`` (R3 — cumulative-per-session, so we
+                             take the last/max within a session, not a per-record
+                             sum which would inflate ~Nx).
+      ``command_names``      Counter of first-token command names (R6).
+      ``first_session`` /    ISO timespan bounds across ALL counted sessions.
+      ``last_session``
+      ``payload_format_sessions`` / ``legacy_format_sessions`` — format split.
+
+    Reads CODEX_SESSIONS_DIR at call time so a test ``patch.object`` is honored.
+    """
+    sessions_dir = CODEX_SESSIONS_DIR
+
+    session_count = 0
+    payload_sessions = 0
+    legacy_sessions = 0
+    total_tokens = 0
+    command_names: Counter = Counter()
+    all_session_timestamps: list[datetime] = []
+
+    if not sessions_dir.exists():
+        return _empty_rollout_result()
+
+    for rollout in sorted(sessions_dir.rglob("rollout-*.jsonl")):
+        if not rollout.is_file():
+            continue
+        try:
+            if cutoff is not None:
+                mtime = datetime.fromtimestamp(rollout.stat().st_mtime)
+                if mtime < cutoff:
+                    continue
+        except OSError:
+            continue
+
+        # Per-session accumulators. token_max is the MAX cumulative total within
+        # THIS session; we add only that single value to the global total.
+        session_token_max = 0
+        is_payload_format = False
+        session_timestamps: list[datetime] = []
+
+        try:
+            with open(rollout, "r", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+
+                    # Timespan: read ONLY the envelope timestamp (allowlisted).
+                    ts = _parse_envelope_timestamp(record.get("timestamp"))
+                    if ts is not None:
+                        session_timestamps.append(ts)
+
+                    payload = record.get("payload")
+                    if not isinstance(payload, dict):
+                        # Legacy flat record (or a payload-less envelope): nothing
+                        # token/tool-related is read here by design.
+                        continue
+                    is_payload_format = True
+                    ptype = payload.get("type")
+
+                    if ptype == "token_count":
+                        # R3: cumulative within session — keep the running max.
+                        info = payload.get("info")
+                        if not isinstance(info, dict):
+                            continue  # info==null record → skip, no NoneType crash
+                        usage = info.get("total_token_usage")
+                        if not isinstance(usage, dict):
+                            continue
+                        total = usage.get("total_tokens")
+                        if isinstance(total, int) and total > session_token_max:
+                            session_token_max = total
+
+                    elif ptype == "function_call":
+                        # R6: emit only the first-token command name.
+                        name = _unwrap_command(payload.get("arguments"))
+                        if name:
+                            command_names[name] += 1
+        except OSError:
+            continue
+
+        # Every readable rollout is a session toward count + timespan (R9).
+        session_count += 1
+        if is_payload_format:
+            payload_sessions += 1
+        else:
+            legacy_sessions += 1
+        total_tokens += session_token_max
+        all_session_timestamps.extend(session_timestamps)
+
+    if session_count == 0:
+        return _empty_rollout_result()
+
+    first_session = None
+    last_session = None
+    if all_session_timestamps:
+        first_session = min(all_session_timestamps).isoformat(timespec="seconds")
+        last_session = max(all_session_timestamps).isoformat(timespec="seconds")
+
+    return {
+        "session_count": session_count,
+        "payload_format_sessions": payload_sessions,
+        "legacy_format_sessions": legacy_sessions,
+        "total_tokens": total_tokens,
+        "command_names": dict(command_names.most_common(30)),
+        "first_session": first_session,
+        "last_session": last_session,
+    }
+
+
+def _empty_rollout_result() -> dict:
+    """The zero-data shape (absent/empty sessions dir) — same keys, no crash."""
+    return {
+        "session_count": 0,
+        "payload_format_sessions": 0,
+        "legacy_format_sessions": 0,
+        "total_tokens": 0,
+        "command_names": {},
+        "first_session": None,
+        "last_session": None,
+    }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

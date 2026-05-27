@@ -189,5 +189,244 @@ class OutputContractTest(unittest.TestCase):
             )
 
 
+def _stage_sessions(root: Path, fixtures: dict[str, str]) -> Path:
+    """Copy named fixtures into a temp Codex sessions/ tree (mirroring the real
+    ``sessions/YYYY/MM/DD/rollout-*.jsonl`` nesting) and return the sessions dir.
+
+    ``fixtures`` maps a fixture filename to the dated subpath it lands under, so
+    the recursive glob in ``parse_rollouts`` is exercised exactly as it would be
+    against real data.
+    """
+    sessions = root / "sessions"
+    for fixture_name, dated_subpath in fixtures.items():
+        dest = sessions / dated_subpath
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text((FIXTURES / fixture_name).read_text(encoding="utf-8"), encoding="utf-8")
+    return sessions
+
+
+class RolloutTokenAccountingTest(unittest.TestCase):
+    """R3 — token totals are CUMULATIVE within a session: take the per-session
+    max (last) and SUM the maxes across sessions. Never sum per-record."""
+
+    def test_cumulative_series_takes_max_not_sum(self):
+        # The payload fixture carries 28887, 67874, 107911 (cumulative). The
+        # session total must be the MAX (107911), never the per-record sum
+        # (204672) which would inflate ~the number of token_count records.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-payload-format.jsonl": "2026/05/20/rollout-a.jsonl",
+            })
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+
+        self.assertEqual(result["total_tokens"], 107911)
+        self.assertNotEqual(result["total_tokens"], 204672)  # the per-record sum
+
+    def test_sum_of_per_session_maxes_across_sessions(self):
+        # Two payload sessions: max 107911 + max 6200 = 114111. The cross-session
+        # rule is sum-of-maxes, not max-of-maxes and not a global per-record sum.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-payload-format.jsonl": "2026/05/20/rollout-a.jsonl",
+                "rollout-null-info.jsonl": "2026/05/21/rollout-b.jsonl",
+            })
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+
+        # null-info session's only non-null cumulative total is 6200.
+        self.assertEqual(result["total_tokens"], 107911 + 6200)
+
+    def test_null_info_record_skipped_no_crash(self):
+        # A token_count record with payload.info == null must be skipped without
+        # a NoneType crash; the session's real total (6200) still lands.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-null-info.jsonl": "2026/05/21/rollout-b.jsonl",
+            })
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+        self.assertEqual(result["total_tokens"], 6200)
+
+
+class RolloutDualFormatTest(unittest.TestCase):
+    """R9 — every rollout file counts as a session/timespan regardless of
+    format; token + tool detail comes only from the payload-envelope format."""
+
+    def test_legacy_file_counted_as_session_with_no_token_detail(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-legacy-format.jsonl": "2026/03/01/rollout-legacy.jsonl",
+            })
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+        # Counted toward sessions...
+        self.assertEqual(result["session_count"], 1)
+        # ...but the legacy format carries no token_count records.
+        self.assertEqual(result["total_tokens"], 0)
+
+    def test_session_count_and_timespan_span_both_formats(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-payload-format.jsonl": "2026/05/20/rollout-a.jsonl",
+                "rollout-legacy-format.jsonl": "2026/03/01/rollout-legacy.jsonl",
+                "rollout-null-info.jsonl": "2026/05/21/rollout-b.jsonl",
+            })
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+        self.assertEqual(result["session_count"], 3)
+        # Timespan spans the earliest legacy record ts (session_meta @ 09:00:00)
+        # to the latest record ts of any session (null-info's second token_count
+        # @ 2026-05-21T10:00:30) — timestamps come from every record envelope.
+        self.assertEqual(result["first_session"], "2026-03-01T09:00:00")
+        self.assertEqual(result["last_session"], "2026-05-21T10:00:30")
+
+    def test_empty_sessions_dir_is_clean(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            (root / "sessions").mkdir(parents=True)
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+        self.assertEqual(result["session_count"], 0)
+        self.assertEqual(result["total_tokens"], 0)
+        self.assertEqual(result["command_names"], {})
+
+    def test_absent_sessions_dir_is_clean(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"  # sessions/ deliberately absent
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+        self.assertEqual(result["session_count"], 0)
+        self.assertEqual(result["total_tokens"], 0)
+
+
+class RolloutCommandExtractionTest(unittest.TestCase):
+    """R6 — emit ONLY the first token of the inner command; the shell-runner
+    wrapper (bash -lc) is stripped, and the full command string never leaks."""
+
+    def test_emits_only_first_token_after_unwrap(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-payload-format.jsonl": "2026/05/20/rollout-a.jsonl",
+            })
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+        cmds = result["command_names"]
+        # `git status` -> git ; `npm test` -> npm test (node test-runner allowlist).
+        self.assertEqual(cmds.get("git"), 1)
+        self.assertEqual(cmds.get("npm test"), 1)
+        # The wrapper binaries must never be emitted as command names.
+        self.assertNotIn("bash", cmds)
+        self.assertNotIn("-lc", cmds)
+        # No full command string ever survives as a key.
+        for key in cmds:
+            self.assertNotIn(" -lc ", f" {key} ")
+            self.assertLess(len(key.split()), 3, f"command name too long: {key!r}")
+
+    def test_secret_bearing_command_emits_only_curl_no_secret_leak(self):
+        # The fixture's inner command is
+        #   curl -H 'Authorization: Bearer sk-FAKE123' https://api.example.com/...
+        # Only `curl` may be emitted; the secret and the Bearer scheme must
+        # never appear ANYWHERE in the parsed output.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-secret-bearing.jsonl": "2026/05/22/rollout-secret.jsonl",
+            })
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+
+        self.assertEqual(result["command_names"].get("curl"), 1)
+        # Serialize the WHOLE parsed result and assert the secret never leaks.
+        blob = json.dumps(result)
+        self.assertNotIn("sk-FAKE123", blob)
+        self.assertNotIn("Bearer", blob)
+        self.assertNotIn("Authorization", blob)
+        self.assertNotIn("api.example.com", blob)
+
+
+class RolloutPrivacyGuardTest(unittest.TestCase):
+    """Open-tracking privacy guard — mirrors test_work_surfaces.py. After a full
+    parse, NO content-carrier value (message bodies, reasoning, agent_message,
+    task_complete, command outputs, apply_patch, session_meta prose, etc.) may
+    be materialized into the parsed output."""
+
+    # Substrings that only exist inside content carriers in the fixtures.
+    FORBIDDEN_CONTENT = (
+        "please refactor the parser module",          # user_message.message
+        "add a changelog entry",                       # legacy user_message
+        "Done — added the changelog entry.",           # legacy message.content
+        "On branch main",                              # function_call_output.output
+        "nothing to commit",                           # function_call_output.output
+        '"object":"list"',                             # secret fixture output
+        "git@github.com",                              # session_meta git url
+        "deadbeefcafe",                                # session_meta commit hash
+        "exampleuser/demo-project",                    # session_meta repo/cwd path
+        "sk-FAKE123",                                   # the secret
+        "Bearer",                                       # the auth scheme
+        "Authorization",                                # the header name
+    )
+
+    def test_no_content_carrier_leaks_into_output(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-payload-format.jsonl": "2026/05/20/rollout-a.jsonl",
+                "rollout-legacy-format.jsonl": "2026/03/01/rollout-legacy.jsonl",
+                "rollout-null-info.jsonl": "2026/05/21/rollout-b.jsonl",
+                "rollout-secret-bearing.jsonl": "2026/05/22/rollout-secret.jsonl",
+            })
+            with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                result = codex_extract.parse_rollouts()
+
+        blob = json.dumps(result)
+        for forbidden in self.FORBIDDEN_CONTENT:
+            self.assertNotIn(
+                forbidden, blob,
+                f"content carrier leaked into parsed output: {forbidden!r}",
+            )
+
+    def test_parse_does_not_materialize_content_via_open_tracking(self):
+        # Plant a tracking open() that records every line yielded from a rollout
+        # file, then assert no content-carrier value was ever returned in the
+        # final structure. (The files ARE read; the guarantee is that carriers
+        # are not propagated into output.)
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-payload-format.jsonl": "2026/05/20/rollout-a.jsonl",
+                "rollout-secret-bearing.jsonl": "2026/05/22/rollout-secret.jsonl",
+            })
+
+            import builtins
+            real_open = builtins.open
+            read_files = []
+
+            def tracking_open(file, *args, **kwargs):
+                if str(file).endswith(".jsonl"):
+                    read_files.append(str(file))
+                return real_open(file, *args, **kwargs)
+
+            builtins.open = tracking_open
+            try:
+                with patch.object(codex_extract, "CODEX_SESSIONS_DIR", root / "sessions"):
+                    result = codex_extract.parse_rollouts()
+            finally:
+                builtins.open = real_open
+
+        # Sanity: both rollout files were actually opened/read.
+        self.assertEqual(len(read_files), 2)
+        # And yet nothing from the content carriers reached the output.
+        blob = json.dumps(result)
+        for forbidden in ("sk-FAKE123", "please refactor", '"object":"list"'):
+            self.assertNotIn(forbidden, blob)
+
+
 if __name__ == "__main__":
     unittest.main()
