@@ -152,6 +152,10 @@ class OutputContractTest(unittest.TestCase):
             self.assertIn("Codex Harness Profile", html)
 
     def test_no_include_skills_flag_parses(self):
+        # Unit 5+: the flag still toggles showcase enrichment; we assert the
+        # CLI parses it and writes the report without crashing. The visible
+        # behavior under --no-include-skills is exercised in the skill
+        # inventory tests; here we just confirm the wiring holds end-to-end.
         with TemporaryDirectory() as d:
             root = Path(d) / ".codex"
             root.mkdir(parents=True)
@@ -162,7 +166,9 @@ class OutputContractTest(unittest.TestCase):
             rc = codex_extract.main(["--no-include-skills"])
             self.assertEqual(rc, 0)
             html = next((root / "usage-data").glob("*.html")).read_text()
-            self.assertIn("include_skills=False", html)
+            # Profile shell rendered + the always-on local-only limit present.
+            self.assertIn("Codex Harness Profile", html)
+            self.assertIn("Local Codex CLI usage only", html)
 
     def test_absent_codex_dir_clean_exit(self):
         """Absent ~/.codex → clean 'no Codex data' exit, no crash, no file."""
@@ -894,6 +900,426 @@ class CodexSafetyEdgeCaseTest(unittest.TestCase):
         self.assertEqual(safety["rulesAllowlist"], ["git"])
         # The deny rule's binary must NOT be surfaced (we only parse prefix_rule).
         self.assertNotIn("rm", safety["rulesAllowlist"])
+
+
+def _extract_island(html: str) -> dict:
+    """Pull the JSON island out of the rendered HTML.
+
+    Mirrors how a consumer would read the page: locate the
+    ``<script type="application/json" id="harness-data">…</script>`` block and
+    parse it. Tests use this so they assert against the SAME bytes that ship,
+    not against the structured ``island`` dict returned from ``build_island``.
+    """
+    import re as _re
+    m = _re.search(
+        r'<script type="application/json" id="harness-data">(.*?)</script>',
+        html,
+        flags=_re.DOTALL,
+    )
+    assert m, "island script tag not found in HTML"
+    serialized = m.group(1)
+    # The renderer escapes any inner </script>; reverse it before json.loads.
+    serialized = serialized.replace(r"<\/script>", "</script>")
+    return json.loads(serialized)
+
+
+def _full_profile_codex_root(d: Path, *, sessions: int = 6) -> Path:
+    """Build a rich, ABOVE-FLOOR temp Codex root for the Unit-5 happy path.
+
+    ``sessions`` rollouts of the payload-format fixture are dropped under
+    distinct dated subpaths so ``parse_rollouts`` clears the activity floor;
+    a skills tree, a plugin-bearing config.toml, and a safety rule are also
+    wired in. Returns the codex root path.
+    """
+    root = d / ".codex"
+    root.mkdir(parents=True)
+    # Stage the same fixture under N distinct dated subpaths so the recursive
+    # rollout glob sees N sessions. ``_stage_sessions``' filename-keyed dict
+    # would collapse identical filenames, so write directly.
+    fixture_text = (FIXTURES / "rollout-payload-format.jsonl").read_text(encoding="utf-8")
+    for i in range(sessions):
+        dest = root / "sessions" / "2026" / "05" / f"{20 + i:02d}" / f"rollout-{i}.jsonl"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(fixture_text, encoding="utf-8")
+    # Three skills (one private — must be excluded).
+    skills_dir = root / "skills"
+    _write_skill(skills_dir, "alpha", "name: alpha\ndescription: Does alpha things.")
+    _write_skill(skills_dir, "beta", "name: beta\ndescription: Does beta things.")
+    _write_skill(skills_dir, "secret", "name: secret\ndescription: Hidden.\nrepo: private")
+    # Plugins + safety from config.toml.
+    (root / "config.toml").write_text(
+        'model = "gpt-5.5"\n'
+        'approvals_reviewer = "user"\n\n'
+        '[plugins."github@openai-curated"]\nenabled = true\n\n'
+        '[plugins."slack@openai-curated"]\nenabled = false\n\n'
+        '[projects."/Users/x/proj"]\ntrust_level = "trusted"\n\n'
+        '[apps.connector_deadbeefcafe1234.tools.gmail_send]\napproval_mode = "approve"\n',
+        encoding="utf-8",
+    )
+    (root / "rules").mkdir(parents=True, exist_ok=True)
+    (root / "rules" / "default.rules").write_text(
+        'prefix_rule(pattern=["git", "status"], decision="allow")\n'
+        'prefix_rule(pattern=["npm", "test"], decision="allow")\n',
+        encoding="utf-8",
+    )
+    return root
+
+
+class CodexProfileHappyPathTest(unittest.TestCase):
+    """Unit 5 happy path — rich fixture → island parses, ``tool == "codex"``,
+    token total present, ``skillInventory`` entries have no ``calls`` field,
+    and the envelope carries NO ``schema_version`` / ``generated_at`` keys
+    (R1 — those are Phase 2's contract)."""
+
+    def test_island_envelope_is_tool_only_and_skills_are_inventory(self):
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, profile = codex_extract.generate_profile()
+
+        # Envelope discipline (R1).
+        self.assertEqual(island["tool"], "codex")
+        self.assertNotIn("schema_version", island)
+        self.assertNotIn("generated_at", island)
+
+        # Stats present + above the activity floor.
+        self.assertGreater(island["stats"]["totalTokens"], 0)
+        self.assertEqual(island["stats"]["sessionCount"], 6)
+
+        # localOnly is always True (R12 — local-CLI scope, period).
+        self.assertTrue(island["localOnly"])
+
+        # Skills inventory-only: no ``calls`` / usage count anywhere.
+        self.assertTrue(island["skillInventory"])
+        for entry in island["skillInventory"]:
+            for forbidden in ("calls", "count", "invocations", "usage", "usageCount"):
+                self.assertNotIn(
+                    forbidden, entry,
+                    f"island skill entry leaked usage field {forbidden!r}: {entry!r}",
+                )
+        # Private skill excluded from the inventory entirely.
+        names = [s["name"] for s in island["skillInventory"]]
+        self.assertNotIn("secret", names)
+
+        # HTML structural sanity — the headline section labels all render.
+        # Safety renders as "Safety &amp; Automation" so just check the prefix.
+        for label in ("Tokens", "Tool Usage", "CLI Commands", "Skills",
+                       "Plugins", "Safety", "Workflow Phases", "Work Surfaces"):
+            self.assertIn(label, html, f"section label {label!r} missing")
+        # Verify Safety section is the FULL "Safety & Automation" heading,
+        # not just an incidental occurrence of the word "Safety".
+        self.assertIn("Safety &amp; Automation", html)
+
+        # Above-floor path: the thin-tool caveat is NOT rendered.
+        self.assertNotIn("Limited local Codex signal", html)
+        # But the always-on local-only limit IS.
+        self.assertIn("Local Codex CLI usage only", html)
+
+
+class CodexThinToolCaveatTest(unittest.TestCase):
+    """R12 — below the activity floor we render the slim shell with the
+    'local CLI data only — this person may use Codex more elsewhere' caveat,
+    not the full profile presentation."""
+
+    def test_below_threshold_renders_caveat_not_full_profile(self):
+        # ONE session, ~107k tokens — sessions below floor (5), tokens below
+        # floor (50k). We use the null-info fixture which tops out at 6200
+        # tokens to stay below BOTH floors.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-null-info.jsonl": "2026/05/21/rollout-thin.jsonl",
+            })
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, profile = codex_extract.generate_profile()
+
+        # Below floor by both criteria.
+        self.assertEqual(island["stats"]["sessionCount"], 1)
+        self.assertLess(
+            island["stats"]["totalTokens"],
+            codex_extract.ACTIVITY_FLOOR_TOKENS,
+        )
+        # The slim-shell caveat is present.
+        self.assertIn("Limited local Codex signal", html)
+        self.assertIn(
+            "Local CLI data only — this person may use Codex more elsewhere",
+            html,
+        )
+        # And the always-on local-only limit is still there too.
+        self.assertIn("Local Codex CLI usage only", html)
+        # Island stays full-shape regardless (Phase 2 consumers shouldn't have
+        # to handle two shapes; the slim shell is a presentation choice).
+        self.assertEqual(set(island.keys()), codex_extract.ALLOWED_ISLAND_KEYS)
+
+    def test_above_threshold_renders_full_profile_with_local_only(self):
+        # The happy-path fixture clears 6 sessions → above the session floor.
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, _ = codex_extract.generate_profile()
+
+        # Above-floor: no slim-shell caveat...
+        self.assertNotIn("Limited local Codex signal", html)
+        # ...but the local-only limit is ALWAYS present (R12).
+        self.assertIn("Local Codex CLI usage only", html)
+        # Stats reflect the rich slice.
+        self.assertGreaterEqual(
+            island["stats"]["sessionCount"], codex_extract.ACTIVITY_FLOOR_SESSIONS
+        )
+
+
+class CodexMcpBucketingTest(unittest.TestCase):
+    """R8 — MCP/connector tool names must be normalized at counting time so
+    the verbatim ``mcp__<server>__<tool>`` form never appears in the island or
+    the rendered HTML. The single ``mcp:*`` bucket is what ships."""
+
+    def test_planted_mcp_tool_name_is_bucketed_not_verbatim(self):
+        # Stage a fresh rollout where one function_call carries an
+        # mcp__gmail__send name. The bucketing happens inside parse_rollouts;
+        # the verbatim name must NOT appear anywhere in the final output.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            sessions = root / "sessions" / "2026" / "05" / "30"
+            sessions.mkdir(parents=True)
+            (sessions / "rollout-mcp.jsonl").write_text(
+                '{"timestamp":"2026-05-30T10:00:00Z","type":"session_meta",'
+                '"payload":{"type":"session_meta","id":"sid"}}\n'
+                '{"timestamp":"2026-05-30T10:00:05Z","type":"function_call",'
+                '"payload":{"type":"function_call","name":"mcp__gmail__send",'
+                '"arguments":"{}","call_id":"c1"}}\n'
+                '{"timestamp":"2026-05-30T10:00:06Z","type":"function_call",'
+                '"payload":{"type":"function_call","name":"mcp__slack__post_message",'
+                '"arguments":"{}","call_id":"c2"}}\n'
+                '{"timestamp":"2026-05-30T10:00:07Z","type":"function_call",'
+                '"payload":{"type":"function_call","name":"apply_patch",'
+                '"arguments":"{}","call_id":"c3"}}\n',
+                encoding="utf-8",
+            )
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, _ = codex_extract.generate_profile()
+
+        # The bucket is the only MCP signal that surfaces.
+        self.assertEqual(island["toolUsage"].get("mcp:*"), 2)
+        self.assertEqual(island["toolUsage"].get("apply_patch"), 1)
+        # No verbatim mcp__server__tool form anywhere — neither in HTML nor
+        # the serialized island.
+        for blob in (html, json.dumps(island)):
+            self.assertNotIn("mcp__gmail__send", blob)
+            self.assertNotIn("mcp__slack__post_message", blob)
+            self.assertNotIn("gmail", blob)
+            self.assertNotIn("slack", blob)
+
+
+class CodexIdentityScrubTest(unittest.TestCase):
+    """R8 — repository_url / cwd / commit_hash / branch must never appear in
+    the HTML OR the serialized island, even though the source fixtures carry
+    them. The positive read-allowlist in parse_rollouts is the primary control;
+    this test verifies the chain end-to-end."""
+
+    def test_planted_repository_url_and_cwd_absent_from_both_html_and_island(self):
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, _ = codex_extract.generate_profile()
+
+        # The payload fixture's session_meta carries these — they must not leak.
+        forbidden_strings = [
+            "git@github.com",                    # repository_url
+            "exampleuser/demo-project",          # repo + cwd path fragment
+            "deadbeefcafe0000",                  # commit_hash prefix
+            "/Users/exampleuser",                # cwd home leak
+        ]
+        serialized_island = json.dumps(island)
+        for forbidden in forbidden_strings:
+            self.assertNotIn(
+                forbidden, html,
+                f"identity leak in HTML: {forbidden!r}",
+            )
+            self.assertNotIn(
+                forbidden, serialized_island,
+                f"identity leak in serialized island: {forbidden!r}",
+            )
+
+    def test_connector_uuid_section_key_absent_from_emitted_profile(self):
+        # The fixture config has [apps.connector_deadbeefcafe1234.tools...].
+        # Safety extraction reads only the approval_mode VALUE; the UUID
+        # section key must never reach the page or the island.
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, _ = codex_extract.generate_profile()
+
+        for blob in (html, json.dumps(island)):
+            self.assertNotIn("connector_", blob)
+            self.assertNotIn("deadbeefcafe1234", blob)
+            self.assertNotIn("gmail_send", blob)
+            self.assertNotIn("/Users/x/proj", blob)
+
+
+class CodexIslandSubsetRenderedTest(unittest.TestCase):
+    """R11 — the set of island data keys must equal the set of rendered field
+    categories. No island-only field may exist (it would silently ship a leak
+    that the HTML doesn't visibly disclose)."""
+
+    def test_island_keys_match_rendered_section_categories(self):
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, _ = codex_extract.generate_profile()
+
+        # The committed island schema is the constant set.
+        self.assertEqual(
+            set(island.keys()),
+            codex_extract.ALLOWED_ISLAND_KEYS,
+            "island deviated from ALLOWED_ISLAND_KEYS — update the contract"
+            " (and the renderer + the section map) deliberately.",
+        )
+        # Every island data key (envelope markers excluded) has a rendered
+        # section. Section labels containing "&" are HTML-escaped in the page
+        # so check against the escaped form.
+        envelope_markers = {"tool", "localOnly"}
+        for key in island.keys() - envelope_markers:
+            section_label = codex_extract._ISLAND_KEY_TO_RENDERED_SECTION[key]
+            escaped = section_label.replace("&", "&amp;")
+            self.assertTrue(
+                section_label in html or escaped in html,
+                f"island key {key!r} → rendered section {section_label!r} "
+                "missing from HTML",
+            )
+
+    def test_envelope_excludes_phase2_owned_keys(self):
+        # R1 — schema_version / generated_at are Phase 2's contract; Phase 1
+        # must NOT pre-commit them on the island envelope.
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            _, island, _ = codex_extract.generate_profile()
+        self.assertNotIn("schema_version", island)
+        self.assertNotIn("generated_at", island)
+        self.assertNotIn("schemaVersion", island)
+        self.assertNotIn("generatedAt", island)
+
+    def test_island_in_html_parses_back_to_same_envelope(self):
+        # The bytes that SHIP must round-trip to the same envelope discipline.
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, _ = codex_extract.generate_profile()
+        parsed = _extract_island(html)
+        self.assertEqual(parsed["tool"], "codex")
+        self.assertEqual(set(parsed.keys()), codex_extract.ALLOWED_ISLAND_KEYS)
+        self.assertEqual(parsed["stats"], island["stats"])
+
+
+class CodexNoHardcodedAuthorClaimsTest(unittest.TestCase):
+    """F6 — with a THIN-data fixture the rendered prose must NOT claim safety
+    features the fixture data doesn't show. Phase-0 finding F6: the Claude
+    ``generate_writeup`` template was author-frozen and lied on others'
+    reports. We don't repeat that — every claim is derived from data."""
+
+    def test_thin_data_does_not_claim_destructive_command_guarding(self):
+        # Zero rules + zero approval modes + zero plugins → the rendered HTML
+        # MUST say "none configured" / "no signal", never claim the user has
+        # safety hardening they don't have.
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _stage_sessions(root, {
+                "rollout-null-info.jsonl": "2026/05/21/rollout-thin.jsonl",
+            })
+            # Minimal config — no approvals_reviewer, no apps, no projects.
+            (root / "config.toml").write_text(
+                'model = "gpt-5.5"\n', encoding="utf-8",
+            )
+            # No rules dir.
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            html, island, _ = codex_extract.generate_profile()
+
+        # The prose must NOT manufacture safety claims.
+        forbidden_phrases = [
+            "destructive command guarding",
+            "blocks dangerous commands",
+            "enforces approval on",
+            "automatically guards",
+            # Generic "this user has X" claims that the Claude writeup made.
+            "This user has configured",
+            "This author enforces",
+        ]
+        for phrase in forbidden_phrases:
+            self.assertNotIn(
+                phrase, html,
+                f"prose hardcoded an author-specific safety claim: {phrase!r}",
+            )
+
+        # And the honest empty-state markers ARE present.
+        self.assertIn("none configured", html)
+        # Thin slice: the slim shell + caveat.
+        self.assertIn("Limited local Codex signal", html)
+        # Plugins absent → empty-state message.
+        self.assertIn("No plugins declared", html)
+
+
+class CodexMainWritesIslandTest(unittest.TestCase):
+    """End-to-end via main() — the report file ON DISK carries the island
+    embedded in a parseable form. The output contract (final stdout line is
+    the report path) still holds."""
+
+    def test_main_writes_html_with_embedded_island(self):
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+
+            captured = []
+            with patch("builtins.print") as mock_print:
+                def _record(*a, **kw):
+                    if "file" not in kw or kw["file"] is sys.stdout:
+                        captured.append(" ".join(str(x) for x in a))
+                mock_print.side_effect = _record
+                rc = codex_extract.main([])
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(captured)
+            report_path = Path(captured[-1])
+            html = report_path.read_text(encoding="utf-8")
+
+        # The island parses back from the file on disk.
+        parsed = _extract_island(html)
+        self.assertEqual(parsed["tool"], "codex")
+        self.assertIn("totalTokens", parsed["stats"])
+        # The page declares the local-only limit.
+        self.assertIn("Local Codex CLI usage only", html)
 
 
 if __name__ == "__main__":

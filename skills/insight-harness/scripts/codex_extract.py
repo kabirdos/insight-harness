@@ -27,6 +27,7 @@ path-/shape-coupled parts are reimplemented for Codex's real data shapes.
 from __future__ import annotations
 
 import argparse
+import html as _html_lib
 import json
 import re
 import sys
@@ -96,6 +97,36 @@ VERSION = "0.1.0"  # Phase 1 scaffold — bump as units land.
 # runner. A leading runner followed by a -c/-lc flag means "run this string".
 _SHELL_RUNNERS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 _RUNNER_FLAGS = {"-c", "-lc", "-ic", "-l"}
+
+# Function-call ``name`` values that route to the command extractor (R6) rather
+# than counting as a generic tool. ``shell`` and ``exec_command`` are the two
+# real-Codex shapes whose ``arguments`` carry a structured command list/string.
+_SHELL_TOOL_NAMES = {"shell", "exec_command", "container.exec"}
+
+# MCP/connector tool names take the shape ``mcp__<server>__<tool>`` (verified
+# against real ~/.codex sessions and the cross-tool MCP convention). Bucketing
+# them to a single ``mcp:*`` label is R8 — emitting verbatim would reveal the
+# connected server (Gmail/Slack/etc.) and any embedded connector UUID, which is
+# an identity leak. The bucket is intentionally generic ("this user has SOME
+# MCP traffic"), not per-server.
+_MCP_BUCKET = "mcp:*"
+
+
+def _normalize_tool_name(name: str) -> str | None:
+    """Return a privacy-safe tool-name label for the toolUsage counter.
+
+    * ``mcp__<server>__<tool>`` (any number of segments) → ``mcp:*`` (R8 —
+      never reveal connector identity / UUID).
+    * Empty / non-string → ``None`` (caller skips).
+    * Otherwise the raw name is returned. Codex's native tool names (e.g.
+      ``apply_patch``, ``update_plan``, ``view_image``, ``spawn_agent``) are
+      generic CLI primitives, not user identifiers, so they pass through.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    if name.startswith("mcp__"):
+        return _MCP_BUCKET
+    return name
 
 
 def _unwrap_command(arguments: str):
@@ -191,6 +222,10 @@ def parse_rollouts(cutoff: datetime | None = None) -> dict:
     legacy_sessions = 0
     total_tokens = 0
     command_names: Counter = Counter()
+    # Generic function_call tool counter (non-shell), with MCP names bucketed
+    # at counting time so the verbatim ``mcp__<server>__<tool>`` form is never
+    # materialized into the aggregate (R8).
+    tool_usage: Counter = Counter()
     all_session_timestamps: list[datetime] = []
 
     if not sessions_dir.exists():
@@ -252,10 +287,19 @@ def parse_rollouts(cutoff: datetime | None = None) -> dict:
                             session_token_max = total
 
                     elif ptype == "function_call":
-                        # R6: emit only the first-token command name.
-                        name = _unwrap_command(payload.get("arguments"))
-                        if name:
-                            command_names[name] += 1
+                        fname = payload.get("name")
+                        if isinstance(fname, str) and fname in _SHELL_TOOL_NAMES:
+                            # R6: emit only the first-token command name.
+                            name = _unwrap_command(payload.get("arguments"))
+                            if name:
+                                command_names[name] += 1
+                        else:
+                            # Generic tool call (apply_patch / update_plan /
+                            # mcp__*/etc.). Bucket MCP identities at counting
+                            # time so they cannot leak from the Counter.
+                            bucketed = _normalize_tool_name(fname)
+                            if bucketed:
+                                tool_usage[bucketed] += 1
         except OSError:
             continue
 
@@ -283,6 +327,7 @@ def parse_rollouts(cutoff: datetime | None = None) -> dict:
         "legacy_format_sessions": legacy_sessions,
         "total_tokens": total_tokens,
         "command_names": dict(command_names.most_common(30)),
+        "tool_usage": dict(tool_usage.most_common(30)),
         "first_session": first_session,
         "last_session": last_session,
     }
@@ -296,6 +341,7 @@ def _empty_rollout_result() -> dict:
         "legacy_format_sessions": 0,
         "total_tokens": 0,
         "command_names": {},
+        "tool_usage": {},
         "first_session": None,
         "last_session": None,
     }
@@ -694,32 +740,617 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def generate_html(data: dict) -> str:
-    """Render the Codex HTML profile.
+# --- Profile assembly (Unit 5) ----------------------------------------------
+# Unit 5 wires Units 2/3/4 together into a Codex-shaped HTML profile and a
+# tool-only JSON island. Key invariants:
+#
+#  * ENVELOPE (R1): the only committed envelope key is ``tool``. We deliberately
+#    do NOT emit ``schema_version``/``generated_at`` — those belong to Phase 2's
+#    cross-tool contract once it also retrofits the Claude island + DB column.
+#  * ISLAND ⊆ RENDERED (R11): every key in the JSON island must correspond to
+#    data the HTML actually renders. ``ALLOWED_ISLAND_KEYS`` is the constant
+#    set; ``_assert_island_subset_of_rendered`` enforces it at emit time so an
+#    island-only field cannot silently ship a leak.
+#  * IDENTITY SCRUBBING (R8): no ``repository_url``, ``commit_hash``, ``branch``,
+#    or ``cwd`` is read or emitted (the rollout parser's positive read-allowlist
+#    handles this by construction); MCP tool names are bucketed at counting time
+#    (see ``_normalize_tool_name``).
+#  * ACTIVITY FLOOR (R12): below the floor the renderer emits a SLIM SHELL with
+#    a prominent "local CLI data only — this person may use Codex more
+#    elsewhere" caveat. Above the floor we render the full profile but ALWAYS
+#    still include the local-only limit statement.
+#  * NO HARDCODED AUTHOR CLAIMS (Phase-0 F6): every prose claim is derived from
+#    data, not a baked-in narrative. Sections with no data say so explicitly.
 
-    SCAFFOLD ONLY — Unit 5 reimplements this with the real Codex section set,
-    the JSON island (``{"tool": "codex", ...}``), the thin-tool caveat, and the
-    honest local-only limit. For now it emits a minimal, valid HTML document so
-    the output contract (a written file + a printed path) can be exercised end
-    to end.
+# Activity-floor threshold. The real ~/.codex has ~hundreds of rollouts for a
+# heavy user; below ~5 sessions the profile is mostly empty (no meaningful
+# token total, no command pattern), so we render the slim shell instead of
+# pretending it's a full profile. A token-only fallback handles users with
+# few but heavy sessions (a single big session can clear 200k tokens).
+ACTIVITY_FLOOR_SESSIONS = 5
+ACTIVITY_FLOOR_TOKENS = 50_000
+
+# The committed island schema. Every key here must correspond to a section the
+# HTML actually renders (R11). The set is checked in two directions:
+#   * island_keys ⊆ rendered_sections (no hidden field)
+#   * island_keys are stable so Phase 2 can plan its merge without surprise.
+ALLOWED_ISLAND_KEYS = frozenset({
+    "tool",
+    "stats",
+    "toolUsage",
+    "cliTools",
+    "skillInventory",
+    "plugins",
+    "safety",
+    "workflowData",
+    "workSurfaces",
+    "localOnly",
+})
+
+
+def _he(value) -> str:
+    """HTML-escape ``value`` (coerced to str). Centralized so every section
+    helper goes through the same escaper and no raw string slips into the DOM."""
+    return _html_lib.escape("" if value is None else str(value), quote=True)
+
+
+def _meets_activity_floor(stats: dict) -> bool:
+    """True iff the Codex slice has enough signal to render as a full profile.
+
+    R12 — below the floor we render a slim shell + caveat instead of a fake
+    full profile. The OR-of-two-floors (sessions or tokens) catches both a
+    long-tail user (many small sessions) and a power user with a few huge
+    sessions.
     """
-    generated_at = datetime.now().isoformat(timespec="seconds")
-    include_skills = bool(data.get("include_skills", True))
+    sessions = stats.get("sessionCount") or 0
+    tokens = stats.get("totalTokens") or 0
+    return (sessions >= ACTIVITY_FLOOR_SESSIONS) or (tokens >= ACTIVITY_FLOOR_TOKENS)
+
+
+def assemble_profile(include_skills: bool = True) -> dict:
+    """Gather every Unit-2/3/4 output into a single profile dict.
+
+    Returns a dict keyed by the same names as ``ALLOWED_ISLAND_KEYS`` plus a
+    ``meta`` block (generation timestamp, version) used only by the HTML header
+    (not emitted in the island). Reads CODEX_* globals at call time so a test
+    ``patch.object`` repoints the whole tree.
+    """
+    rollouts = parse_rollouts()
+    skills = extract_skill_inventory_codex(include_showcase=include_skills)
+    plugins = extract_plugins_from_config()
+    safety = extract_safety_posture()
+
+    # R13 — desktop presence via the shared detector. Surface ONLY the Codex
+    # entries (CLI + desktop) so other tools' presence isn't a side channel.
+    agent_tools = detect_agent_tools()
+    desktop_presence = [
+        {
+            "tool": t.get("tool"),
+            "present": bool(t.get("present")),
+            "lastActive": t.get("lastActive"),
+        }
+        for t in agent_tools
+        if isinstance(t.get("tool"), str) and t["tool"].startswith("Codex")
+    ]
+
+    timespan = None
+    first = rollouts.get("first_session")
+    last = rollouts.get("last_session")
+    if first and last:
+        timespan = {"first": first, "last": last}
+
+    stats = {
+        "totalTokens": rollouts.get("total_tokens", 0),
+        "sessionCount": rollouts.get("session_count", 0),
+        "payloadFormatSessions": rollouts.get("payload_format_sessions", 0),
+        "legacyFormatSessions": rollouts.get("legacy_format_sessions", 0),
+        "timespan": timespan,
+    }
+
+    # The HTML's "CLI Commands" panel renders this directly.
+    cli_tools = dict(rollouts.get("command_names", {}))
+    tool_usage = dict(rollouts.get("tool_usage", {}))
+
+    # Workflow Phases: Codex's rollout parser does not currently classify a
+    # phase signal (the cost would require reading content carriers, which the
+    # positive read-allowlist forbids). Surface an empty structure — the HTML
+    # renders the honest "no phase signal collected" message rather than
+    # fabricating phases. Phase 2 may add a phase-from-tool-sequence heuristic.
+    workflow_data = {"phaseSequence": [], "phaseTransitions": {}}
+
+    return {
+        "meta": {
+            "generatedAt": datetime.now().isoformat(timespec="seconds"),
+            "version": VERSION,
+        },
+        "stats": stats,
+        "toolUsage": tool_usage,
+        "cliTools": cli_tools,
+        "skillInventory": skills,
+        "plugins": plugins,
+        "safety": safety,
+        "workflowData": workflow_data,
+        "workSurfaces": {"desktopPresence": desktop_presence},
+    }
+
+
+def build_island(profile: dict) -> dict:
+    """Produce the ``{tool: "codex", ...}`` JSON island envelope.
+
+    R1 — envelope key is ``tool`` ONLY (no ``schema_version`` /
+    ``generated_at``). R11 — every key must be in ``ALLOWED_ISLAND_KEYS`` and
+    correspond to a rendered section.
+    """
+    island = {
+        "tool": "codex",
+        "stats": profile["stats"],
+        "toolUsage": profile["toolUsage"],
+        "cliTools": profile["cliTools"],
+        "skillInventory": profile["skillInventory"],
+        "plugins": profile["plugins"],
+        "safety": profile["safety"],
+        "workflowData": profile["workflowData"],
+        "workSurfaces": profile["workSurfaces"],
+        # Always-true flag (R12): this is local-CLI-only data, period.
+        "localOnly": True,
+    }
+    extra = set(island.keys()) - ALLOWED_ISLAND_KEYS
+    if extra:
+        # Defense in depth: the constant set is the contract. A typo or a new
+        # field added without updating ALLOWED_ISLAND_KEYS would otherwise
+        # silently ship.
+        raise AssertionError(
+            f"island contains keys not in ALLOWED_ISLAND_KEYS: {sorted(extra)}"
+        )
+    return island
+
+
+# Rendered-section labels for the R11 ⊆ check. Each label corresponds to one
+# of the section helpers below; the renderer collects which sections actually
+# emitted content and that set must be a superset of the island's keys minus
+# the envelope-level ``tool`` / ``localOnly`` markers (which are rendered as
+# the page header and the always-on caveat, not their own sections).
+_ISLAND_KEY_TO_RENDERED_SECTION = {
+    "stats": "Tokens",
+    "toolUsage": "Tool Usage",
+    "cliTools": "CLI Commands",
+    "skillInventory": "Skills",
+    "plugins": "Plugins",
+    "safety": "Safety & Automation",
+    "workflowData": "Workflow Phases",
+    "workSurfaces": "Work Surfaces",
+}
+
+
+def _assert_island_subset_of_rendered(island: dict, rendered_sections: set) -> None:
+    """R11 — every island data key must be a section the HTML renders.
+
+    Skips the envelope-level markers (``tool``, ``localOnly``) which are
+    rendered as the page header/caveat, not as their own ``<section>``. Raises
+    AssertionError if any island data key has no matching rendered section so a
+    leak via an island-only field is impossible.
+    """
+    envelope_only = {"tool", "localOnly"}
+    for key in island.keys():
+        if key in envelope_only:
+            continue
+        section = _ISLAND_KEY_TO_RENDERED_SECTION.get(key)
+        if section is None:
+            raise AssertionError(
+                f"island key {key!r} has no _ISLAND_KEY_TO_RENDERED_SECTION mapping"
+            )
+        if section not in rendered_sections:
+            raise AssertionError(
+                f"island key {key!r} maps to unrendered section {section!r}"
+            )
+
+
+# --- HTML section helpers ----------------------------------------------------
+# Each helper takes the relevant slice of the profile and returns (section_html,
+# section_label). The label is appended to rendered_sections for the R11 check
+# even when the section is empty — the HTML always renders the SECTION SHELL so
+# the island/HTML correspondence does not depend on data presence.
+
+
+# The always-on local-only caveat — rendered both above and below the activity
+# floor. This is the load-bearing honest-limit statement; the prose is derived
+# (no hardcoded author claims) so it never makes a quantitative promise we
+# can't back from data.
+_LOCAL_ONLY_CAVEAT = (
+    "Local Codex CLI usage only — this profile reflects what is recorded "
+    "under <code>~/.codex/</code> on this machine. Mobile, web, and Cowork "
+    "activity is server-side and not captured here. This person may use "
+    "Codex more elsewhere."
+)
+
+
+def _render_thin_tool_caveat() -> str:
+    """The slim-shell caveat for users below the activity floor (R12).
+
+    Stated as "local CLI data only" without claiming the user is inactive —
+    they may simply be using Codex elsewhere (mobile / web / Cowork). Prose
+    intentionally avoids any author-specific quantitative claim (F6).
+    """
     return (
-        "<!doctype html>\n"
-        "<html lang=\"en\">\n"
-        "<head><meta charset=\"utf-8\">"
-        "<title>Codex Harness Profile</title></head>\n"
-        "<body>\n"
-        "  <h1>Codex Harness Profile</h1>\n"
-        f"  <p>Generated {generated_at} by codex_extract {VERSION}.</p>\n"
-        "  <p>Local Codex CLI usage only — mobile, web, and Cowork activity is "
-        "server-side and not captured here.</p>\n"
-        f"  <!-- include_skills={include_skills} -->\n"
-        "  <!-- scaffold: sections filled in by later units -->\n"
-        "</body>\n"
-        "</html>\n"
+        '<section class="caveat thin-tool"><h2>Limited local Codex signal</h2>'
+        '<p><strong>Local CLI data only — this person may use Codex more '
+        "elsewhere.</strong> The Codex CLI activity recorded under "
+        "<code>~/.codex/</code> on this machine is below the threshold for a "
+        "full profile. Mobile, web, and Cowork sessions are server-side and "
+        "not captured here.</p></section>"
     )
+
+
+def _render_header(profile: dict, full_profile: bool) -> str:
+    """Page header + the always-on local-only caveat (R12)."""
+    meta = profile["meta"]
+    return (
+        '<header class="codex-profile-header">'
+        "<h1>Codex Harness Profile</h1>"
+        f'<p class="meta">Generated {_he(meta["generatedAt"])} '
+        f"by codex_extract {_he(meta['version'])}.</p>"
+        f'<p class="local-only-limit">{_LOCAL_ONLY_CAVEAT}</p>'
+        "</header>"
+    )
+
+
+def _render_tokens_section(stats: dict) -> tuple[str, str]:
+    """Tokens section — total + session count + timespan + format split.
+
+    Prose is derived from the numbers, not hardcoded. A 0-token slice says so
+    rather than implying activity that isn't in the data (F6).
+    """
+    total = stats.get("totalTokens") or 0
+    sessions = stats.get("sessionCount") or 0
+    payload_n = stats.get("payloadFormatSessions") or 0
+    legacy_n = stats.get("legacyFormatSessions") or 0
+    timespan = stats.get("timespan")
+
+    timespan_html = ""
+    if timespan and timespan.get("first") and timespan.get("last"):
+        timespan_html = (
+            f'<p class="meta">Sessions span <strong>{_he(timespan["first"])}'
+            f'</strong> to <strong>{_he(timespan["last"])}</strong>.</p>'
+        )
+
+    # Honest-limit detail: token totals come from the current payload-envelope
+    # format only. Legacy sessions still COUNT (R9) but contribute no tokens.
+    detail = ""
+    if legacy_n > 0:
+        detail = (
+            f'<p class="meta">Of {_he(sessions)} sessions, '
+            f'{_he(payload_n)} use the current payload format (token detail '
+            f'available) and {_he(legacy_n)} use the legacy format '
+            "(counted toward session totals; no per-session token detail).</p>"
+        )
+
+    body = (
+        '<section class="codex-tokens">'
+        "<h2>Tokens</h2>"
+        f'<div class="kv-row"><span>Total tokens (cumulative-per-session, '
+        f'summed across sessions):</span><strong>{_he(total):>}</strong></div>'
+        f'<div class="kv-row"><span>Sessions counted:</span>'
+        f'<strong>{_he(sessions)}</strong></div>'
+        + timespan_html
+        + detail
+        + "</section>"
+    )
+    return body, "Tokens"
+
+
+def _render_tool_usage_section(tool_usage: dict) -> tuple[str, str]:
+    """Tool Usage — generic function_call tally (apply_patch, update_plan,
+    etc.). MCP tool names are bucketed at counting time, so any ``mcp:*`` row
+    here is the entire MCP-traffic bucket, not a server-specific identifier."""
+    if not tool_usage:
+        rows = '<p class="empty">No tool-call signal in this slice.</p>'
+    else:
+        items = sorted(tool_usage.items(), key=lambda kv: (-kv[1], kv[0]))
+        rows = "".join(
+            f'<div class="kv-row"><span class="mono">{_he(name)}</span>'
+            f'<strong>{_he(count)}</strong></div>'
+            for name, count in items
+        )
+    return (
+        '<section class="codex-tool-usage"><h2>Tool Usage</h2>' + rows + "</section>",
+        "Tool Usage",
+    )
+
+
+def _render_cli_tools_section(cli_tools: dict) -> tuple[str, str]:
+    """CLI Commands — first-token of unwrapped shell commands (R6). The full
+    command string is never emitted; only the binary name lands here."""
+    if not cli_tools:
+        rows = '<p class="empty">No CLI command activity recorded.</p>'
+    else:
+        items = sorted(cli_tools.items(), key=lambda kv: (-kv[1], kv[0]))
+        rows = "".join(
+            f'<div class="kv-row"><span class="mono">{_he(name)}</span>'
+            f'<strong>{_he(count)}</strong></div>'
+            for name, count in items
+        )
+    return (
+        '<section class="codex-cli-tools"><h2>CLI Commands</h2>' + rows + "</section>",
+        "CLI Commands",
+    )
+
+
+def _render_skills_section(skills: list) -> tuple[str, str]:
+    """Skills — INVENTORY ONLY (D4): name + description + installPointer. No
+    usage counts (Codex has no reliable per-skill invocation signal)."""
+    if not skills:
+        rows = '<p class="empty">No skills declared under <code>~/.codex/skills/</code>.</p>'
+    else:
+        rows = "".join(
+            f'<div class="skill-entry">'
+            f'<h3>{_he(s.get("name") or s.get("installPointer") or "")}</h3>'
+            f'<p>{_he(s.get("description") or "")}</p>'
+            f'<p class="meta">Install pointer: '
+            f'<code>{_he(s.get("installPointer") or "")}</code></p>'
+            "</div>"
+            for s in skills
+        )
+    return (
+        '<section class="codex-skills"><h2>Skills</h2>'
+        '<p class="meta">Inventory only — Codex loads skills into context; '
+        "there is no reliable per-skill invocation signal at this layer.</p>"
+        + rows
+        + "</section>",
+        "Skills",
+    )
+
+
+def _render_plugins_section(plugins: list) -> tuple[str, str]:
+    """Plugins — name + enabled flag from config.toml ``[plugins.*]`` (R10)."""
+    if not plugins:
+        rows = '<p class="empty">No plugins declared in <code>config.toml</code>.</p>'
+    else:
+        rows = "".join(
+            f'<div class="kv-row"><span class="mono">{_he(p.get("name"))}</span>'
+            f'<span class="badge {"on" if p.get("enabled") else "off"}">'
+            f'{"enabled" if p.get("enabled") else "disabled"}</span></div>'
+            for p in plugins
+        )
+    return (
+        '<section class="codex-plugins"><h2>Plugins</h2>' + rows + "</section>",
+        "Plugins",
+    )
+
+
+def _render_safety_section(safety: dict) -> tuple[str, str]:
+    """Safety & Automation — enums + binaries only (R4)."""
+    reviewer = safety.get("approvalsReviewer")
+    approval_modes = safety.get("approvalModes") or []
+    trust_levels = safety.get("trustLevels") or []
+    rules = safety.get("rulesAllowlist") or []
+
+    reviewer_html = (
+        f'<div class="kv-row"><span>Approvals reviewer:</span>'
+        f'<strong>{_he(reviewer)}</strong></div>'
+        if reviewer
+        else '<div class="kv-row"><span>Approvals reviewer:</span>'
+        '<span class="meta">none configured</span></div>'
+    )
+
+    def _enum_row(label, values):
+        if not values:
+            return (
+                f'<div class="kv-row"><span>{_he(label)}:</span>'
+                f'<span class="meta">none configured</span></div>'
+            )
+        chips = "".join(
+            f'<span class="chip">{_he(v)}</span>' for v in values
+        )
+        return (
+            f'<div class="kv-row"><span>{_he(label)}:</span>'
+            f'<span class="chips">{chips}</span></div>'
+        )
+
+    rules_html = (
+        '<p class="empty">No rules allowlist configured.</p>'
+        if not rules
+        else (
+            '<h3>Allowlisted rule binaries</h3><div class="chips">'
+            + "".join(f'<span class="chip mono">{_he(b)}</span>' for b in rules)
+            + "</div>"
+        )
+    )
+
+    return (
+        '<section class="codex-safety"><h2>Safety &amp; Automation</h2>'
+        + reviewer_html
+        + _enum_row("Approval modes", approval_modes)
+        + _enum_row("Trust levels", trust_levels)
+        + rules_html
+        + "</section>",
+        "Safety & Automation",
+    )
+
+
+def _render_workflow_phases_section(workflow: dict) -> tuple[str, str]:
+    """Workflow Phases — honest empty state when no phase signal is available."""
+    transitions = workflow.get("phaseTransitions") or {}
+    if not transitions:
+        body = (
+            '<p class="empty">No phase signal collected — Codex Phase 1 does '
+            "not infer phases from content (content carriers are never read).</p>"
+        )
+    else:
+        items = sorted(transitions.items(), key=lambda kv: (-kv[1], kv[0]))
+        body = "".join(
+            f'<div class="kv-row"><span class="mono">{_he(k)}</span>'
+            f'<strong>{_he(v)}</strong></div>'
+            for k, v in items
+        )
+    return (
+        '<section class="codex-workflow"><h2>Workflow Phases</h2>' + body + "</section>",
+        "Workflow Phases",
+    )
+
+
+def _render_work_surfaces_section(work_surfaces: dict) -> tuple[str, str]:
+    """Work Surfaces — Codex CLI + desktop presence (R13). Directory presence
+    + mtime ONLY; contents are never read."""
+    presence = work_surfaces.get("desktopPresence") or []
+    if not presence:
+        rows = '<p class="empty">No Codex surfaces detected.</p>'
+    else:
+        rows = "".join(
+            f'<div class="kv-row"><span>{_he(t.get("tool"))}</span>'
+            f'<span class="badge {"on" if t.get("present") else "off"}">'
+            f'{"present" if t.get("present") else "absent"}</span>'
+            + (
+                f'<span class="meta">last active {_he(t.get("lastActive"))}</span>'
+                if t.get("present") and t.get("lastActive")
+                else ""
+            )
+            + "</div>"
+            for t in presence
+        )
+    return (
+        '<section class="codex-work-surfaces"><h2>Work Surfaces</h2>'
+        '<p class="meta">Directory presence + mtime only; contents are not '
+        "read.</p>" + rows + "</section>",
+        "Work Surfaces",
+    )
+
+
+def _render_footer(profile: dict) -> str:
+    meta = profile["meta"]
+    return (
+        '<footer class="codex-profile-footer">'
+        f'<p class="meta">Generated by codex_extract {_he(meta["version"])} '
+        f'at {_he(meta["generatedAt"])}. Local-CLI scope; no upload.</p>'
+        "</footer>"
+    )
+
+
+def _render_island_script(island: dict) -> str:
+    """Serialize the island and embed it in a ``<script type="application/json"
+    id="harness-data">…</script>`` tag, mirroring extract.py's pattern.
+
+    The mandatory ``</script>`` escape prevents a serialized field from
+    breaking out of the script element — same defense as the Claude extractor
+    (see ``extract.py`` lines 2572-2574)."""
+    serialized = json.dumps(island, separators=(",", ":"))
+    serialized = serialized.replace("</script>", r"<\/script>")
+    return (
+        '<script type="application/json" id="harness-data">'
+        + serialized
+        + "</script>"
+    )
+
+
+_CSS = """
+:root { --ink:#1a1a1a; --muted:#666; --bg:#f8f7f4; --card:#fff;
+  --accent:#1e3a5f; --green:#2d6a4f; --amber:#b45309; --border:#e5e7eb; }
+* { box-sizing:border-box; }
+body { margin:0; font:16px/1.5 system-ui,-apple-system,sans-serif;
+  background:var(--bg); color:var(--ink); padding:2rem; }
+.codex-profile { max-width:880px; margin:0 auto; }
+header.codex-profile-header { background:var(--card); padding:1.5rem;
+  border:1px solid var(--border); border-radius:8px; margin-bottom:1.5rem; }
+header.codex-profile-header h1 { margin:0 0 0.5rem 0; }
+.local-only-limit { background:#fef3c7; border-left:4px solid var(--amber);
+  padding:0.75rem 1rem; margin:0.75rem 0 0 0; }
+section { background:var(--card); padding:1.25rem; border:1px solid var(--border);
+  border-radius:8px; margin-bottom:1rem; }
+section h2 { margin:0 0 0.75rem 0; font-size:1.15rem; }
+.caveat.thin-tool { background:#fef3c7; border-color:var(--amber); }
+.kv-row { display:flex; justify-content:space-between; gap:1rem;
+  padding:0.35rem 0; border-bottom:1px dashed var(--border); }
+.kv-row:last-child { border-bottom:none; }
+.meta { color:var(--muted); font-size:0.9rem; margin:0.25rem 0; }
+.empty { color:var(--muted); font-style:italic; }
+.mono { font-family:"Source Code Pro",monospace; }
+.chips, .tags { display:flex; gap:0.35rem; flex-wrap:wrap; }
+.chip { background:#eef2f5; border-radius:4px; padding:0.15rem 0.5rem;
+  font-size:0.85rem; }
+.badge { font-size:0.8rem; padding:0.15rem 0.5rem; border-radius:4px; }
+.badge.on { background:#ecfdf5; color:var(--green); }
+.badge.off { background:#f3f4f6; color:var(--muted); }
+.skill-entry { padding:0.5rem 0; border-bottom:1px solid var(--border); }
+.skill-entry:last-child { border-bottom:none; }
+footer.codex-profile-footer { margin-top:1.5rem; text-align:center; }
+"""
+
+
+def render_html(profile: dict, island: dict) -> str:
+    """Render the full Codex HTML profile + the embedded JSON island.
+
+    R12 — below the activity floor we emit a SLIM SHELL with the thin-tool
+    caveat and the local-only limit, NOT the full section set. Above the floor
+    we emit every section helper (which renders its own empty-state when its
+    slice has no data). Either way the island always carries the full key set
+    so a consumer's parser doesn't have two shapes to handle — the slim shell's
+    sections are merely visually de-emphasized in the page.
+    """
+    full = _meets_activity_floor(profile["stats"])
+
+    rendered_sections: set[str] = set()
+    sections_html: list[str] = []
+
+    if not full:
+        # Slim shell — caveat first, then a minimal Stats section so the user
+        # sees what we DID record, but no Tool/CLI/Skills/Safety detail beyond
+        # the section shells (which still render their empty states).
+        sections_html.append(_render_thin_tool_caveat())
+
+    # Always render every section shell so the island ⊆ rendered invariant
+    # holds regardless of activity level. Empty sections render an honest
+    # "no signal" message; this is the F6 guard (no hardcoded claims).
+    for renderer, key in (
+        (_render_tokens_section, "stats"),
+        (_render_tool_usage_section, "toolUsage"),
+        (_render_cli_tools_section, "cliTools"),
+        (_render_skills_section, "skillInventory"),
+        (_render_plugins_section, "plugins"),
+        (_render_safety_section, "safety"),
+        (_render_workflow_phases_section, "workflowData"),
+        (_render_work_surfaces_section, "workSurfaces"),
+    ):
+        html_part, label = renderer(profile[key])
+        sections_html.append(html_part)
+        rendered_sections.add(label)
+
+    # R11 — enforce the subset relationship BEFORE serializing the island into
+    # the page. A failure here is a programming error, not a user-data issue.
+    _assert_island_subset_of_rendered(island, rendered_sections)
+
+    body_inner = (
+        _render_header(profile, full_profile=full)
+        + "".join(sections_html)
+        + _render_footer(profile)
+    )
+
+    island_script = _render_island_script(island)
+
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        '<head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        "<title>Codex Harness Profile</title>"
+        f"<style>{_CSS}</style>"
+        "</head>\n"
+        '<body><div class="codex-profile">'
+        + body_inner
+        + "</div>"
+        + island_script
+        + "</body></html>\n"
+    )
+
+
+def generate_profile(include_skills: bool = True) -> tuple[str, dict, dict]:
+    """End-to-end: assemble, build the island, render the HTML.
+
+    Returns ``(html, island, profile)`` so tests can assert against the
+    structured island AND the rendered HTML without re-parsing the page.
+    """
+    profile = assemble_profile(include_skills=include_skills)
+    island = build_island(profile)
+    html = render_html(profile, island)
+    return html, island, profile
 
 
 def main(argv=None) -> int:
@@ -742,9 +1373,8 @@ def main(argv=None) -> int:
         )
         return 0
 
-    print("Generating Codex profile (scaffold)...", file=sys.stderr)
-    data = {"include_skills": args.include_skills}
-    html = generate_html(data)
+    print("Generating Codex profile...", file=sys.stderr)
+    html, _island, _profile = generate_profile(include_skills=args.include_skills)
 
     CODEX_USAGE_DATA_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d")
