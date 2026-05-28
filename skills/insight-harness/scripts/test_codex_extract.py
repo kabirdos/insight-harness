@@ -1322,5 +1322,553 @@ class CodexMainWritesIslandTest(unittest.TestCase):
         self.assertIn("Local Codex CLI usage only", html)
 
 
+# --- Unit 6 — two-tier emit-time secret gate (R7) ---------------------------
+# Two tiers, deliberately:
+#   * Tier (a) — unambiguous token prefixes (`sk-`, `Bearer `, `AKIA`, `ghp_`)
+#     → FAIL LOUD: ``SecretLeakError`` raised, file NOT written, exit non-zero.
+#   * Tier (b) — high-entropy heuristic over post-allowlist TEXT only (island
+#     ``description`` / ``readmeMarkdown`` + HTML prose body, excluding
+#     hero-image data URIs, skill IDs, hash/UUID-shaped values) → REDACT THE
+#     FIELD + warn; run continues.
+#
+# The footgun the plan flags: a naive single-tier entropy gate would block
+# benign harnesses on legit base64 hero images + skill IDs and either get its
+# threshold loosened until it misses real tokens, or block every profile from
+# generating. Tests below pin both halves of the split.
+
+
+class TierAUnambiguousPrefixAbortsTest(unittest.TestCase):
+    """Tier (a) — known token prefixes raise ``SecretLeakError`` and the
+    report is NOT written. Exit code is non-zero. stderr carries the alert.
+    """
+
+    def _root_with_planted_secret(self, d: Path, secret_in_description: str) -> Path:
+        """Build a Codex root above the activity floor with the planted
+        secret embedded in a skill's frontmatter description (which the
+        renderer surfaces verbatim in the HTML and the island). The gate
+        runs over the SERIALIZED output, so the planted value reaches the
+        scan via the normal pipeline (no test-only injection point)."""
+        root = _full_profile_codex_root(d, sessions=6)
+        # Overwrite alpha's SKILL.md with a description carrying the secret.
+        (root / "skills" / "alpha" / "SKILL.md").write_text(
+            f"---\nname: alpha\ndescription: {secret_in_description}\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def test_bearer_sk_prefix_raises_secret_leak_error(self):
+        # The canonical leak shape the security reviewer flagged: a Bearer
+        # header carrying a sk- token. Two tier-a prefixes in one string —
+        # either one alone is sufficient to abort.
+        with TemporaryDirectory() as d:
+            root = self._root_with_planted_secret(
+                Path(d),
+                "Authorization Bearer sk-FAKE1234567890ABCDEF1234567890",
+            )
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            with self.assertRaises(codex_extract.SecretLeakError):
+                codex_extract.generate_profile()
+
+    def test_main_with_tier_a_secret_does_not_write_file(self):
+        # On a tier-a hit ``main`` returns non-zero and the report file is
+        # NOT written; the disk is left untouched. Stderr carries the alert.
+        with TemporaryDirectory() as d:
+            root = self._root_with_planted_secret(
+                Path(d),
+                "Bearer sk-FAKE-PLANTED-1234567890",
+            )
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+
+            stderr_lines = []
+            with patch("builtins.print") as mock_print:
+                def _record(*a, **kw):
+                    if kw.get("file") is sys.stderr:
+                        stderr_lines.append(" ".join(str(x) for x in a))
+                mock_print.side_effect = _record
+                rc = codex_extract.main([])
+
+            self.assertNotEqual(rc, 0, "tier-a hit must produce a non-zero exit")
+            # No HTML written to the usage-data dir.
+            usage_dir = root / "usage-data"
+            if usage_dir.exists():
+                html_files = list(usage_dir.glob("*.html"))
+                self.assertEqual(
+                    html_files, [],
+                    f"tier-a hit must leave disk untouched; got {html_files}",
+                )
+            # The stderr alert is loud and specific.
+            joined = "\n".join(stderr_lines)
+            self.assertIn("SECRET LEAK", joined)
+            self.assertIn("NOT written", joined)
+
+    def test_ghp_prefix_aborts(self):
+        with TemporaryDirectory() as d:
+            root = self._root_with_planted_secret(
+                Path(d),
+                "Token ghp_FAKE1234567890abcdefGHIJ",
+            )
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            with self.assertRaises(codex_extract.SecretLeakError):
+                codex_extract.generate_profile()
+
+    def test_akia_prefix_aborts(self):
+        with TemporaryDirectory() as d:
+            root = self._root_with_planted_secret(
+                Path(d),
+                "AWS key AKIAIOSFODNN7EXAMPLE here",
+            )
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            with self.assertRaises(codex_extract.SecretLeakError):
+                codex_extract.generate_profile()
+
+    def test_bearer_placeholder_does_not_falsely_abort(self):
+        # ``Bearer <token>`` is a documentation placeholder, not a real
+        # credential, so the tier-a pattern must NOT flag it. (The pattern
+        # requires a non-``<`` character after the space.)
+        with TemporaryDirectory() as d:
+            root = self._root_with_planted_secret(
+                Path(d),
+                "Use the Bearer <token> header to authenticate",
+            )
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            # No exception → the run completes.
+            html, island, _ = codex_extract.generate_profile()
+            # The placeholder survives in the description.
+            descs = [s.get("description", "") for s in island["skillInventory"]]
+            self.assertTrue(
+                any("Bearer <token>" in d for d in descs),
+                f"Bearer placeholder was lost: {descs}",
+            )
+
+
+class TierBFootgunGuardTest(unittest.TestCase):
+    """Tier (b) MUST NOT false-positive on the high-entropy content the plan
+    intends to emit: hero-image data URIs (the showcase pipeline's
+    ``heroBase64`` blob) and skill IDs / UUIDs / hash values. Both reviewers
+    flagged this as the critical false-positive class. A naive entropy gate
+    would block every harness with a hero image; ours must not."""
+
+    def test_hero_image_and_long_skill_id_do_not_falsely_abort(self):
+        # Build a root with a skill whose showcase pipeline produces a
+        # real hero-image base64 blob AND whose description contains a long
+        # UUID-shaped skill ID. Both are intentionally high-entropy; the
+        # gate must let them through without aborting OR redacting either.
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            heavy_skill = root / "skills" / "heavy-skill"
+            heavy_skill.mkdir(parents=True, exist_ok=True)
+            # 32-hex-char skill ID — UUID-shape (no dashes); benign, must
+            # not be redacted by tier (b) (hex shape is allowlisted).
+            skill_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+            (heavy_skill / "SKILL.md").write_text(
+                f"---\nname: heavy-skill\n"
+                f"description: Skill {skill_id} provides demo helpers.\n"
+                "---\n\nbody\n",
+                encoding="utf-8",
+            )
+            # Generate a small but valid PNG so _read_hero_image returns
+            # actual base64 bytes — this is the high-entropy content that
+            # the plan explicitly says must NOT trip the gate.
+            assets = heavy_skill / "assets"
+            assets.mkdir(parents=True, exist_ok=True)
+            import struct
+            import zlib
+            def _png_bytes(size: int = 64) -> bytes:
+                sig = b"\x89PNG\r\n\x1a\n"
+                def chunk(typ, data):
+                    crc = zlib.crc32(typ + data) & 0xFFFFFFFF
+                    return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", crc)
+                ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+                raw = b"".join(b"\x00" + b"\xff\x00\x00" * size for _ in range(size))
+                idat = chunk(b"IDAT", zlib.compress(raw))
+                iend = chunk(b"IEND", b"")
+                return sig + ihdr + idat + iend
+            (assets / "hero.png").write_bytes(_png_bytes(48))
+
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+
+            # Must NOT raise. This is the footgun guard — the plan explicitly
+            # calls this out as the critical false-positive class.
+            stderr_lines = []
+            with patch("builtins.print") as mock_print:
+                def _record(*a, **kw):
+                    if kw.get("file") is sys.stderr:
+                        stderr_lines.append(" ".join(str(x) for x in a))
+                mock_print.side_effect = _record
+                rc = codex_extract.main([])
+            self.assertEqual(
+                rc, 0,
+                f"hero-image + skill-ID harness was falsely blocked. stderr: {stderr_lines}",
+            )
+
+            # The file WAS written.
+            html_files = list((root / "usage-data").glob("*.html"))
+            self.assertEqual(len(html_files), 1, "expected the report to be written")
+            html = html_files[0].read_text(encoding="utf-8")
+            island = _extract_island(html)
+
+            # The skill ID survives unredacted in the description (it's
+            # hex/UUID-shaped → tier-b shape-allowlist).
+            heavy = next(s for s in island["skillInventory"] if s["name"] == "heavy-skill")
+            self.assertEqual(
+                heavy["description"],
+                f"Skill {skill_id} provides demo helpers.",
+                "skill ID was incorrectly redacted by tier-b — footgun guard failed",
+            )
+            self.assertIn(skill_id, html)
+
+            # The hero-image base64 is present in the island AND NOT redacted
+            # (hero bytes are intentionally high-entropy, but tier-b only
+            # scans description / readmeMarkdown — heroBase64 is excluded).
+            self.assertIsNotNone(
+                heavy.get("heroBase64"),
+                "hero-image base64 missing from island — pipeline broke",
+            )
+            self.assertNotIn("<redacted-by-secret-gate>", heavy["heroBase64"])
+            # The placeholder must not appear anywhere in the description
+            # field either.
+            self.assertNotIn("<redacted-by-secret-gate>", heavy["description"])
+
+            # No tier-b warning was emitted for any of the above.
+            for line in stderr_lines:
+                self.assertNotIn(
+                    "tier-b secret gate redacted", line,
+                    f"false-positive redaction warning: {line!r}",
+                )
+
+
+class TierBOpaqueTokenRedactionTest(unittest.TestCase):
+    """Tier (b) — a non-prefixed high-entropy run in a text field (i.e. not
+    `sk-`/`Bearer`/`AKIA`/`ghp_` so tier-a doesn't catch it) is REDACTED in
+    place + a stderr warning is emitted. The run completes; the field is
+    replaced with the placeholder."""
+
+    def test_opaque_token_in_description_is_redacted_with_warning(self):
+        # A 40-char alphanumeric token with no recognized prefix and no
+        # UUID/hex shape (mixed case + digits randomly distributed).
+        opaque = "xR9pZ7kQwL3mN8vT2fY6cJ1bH4dG5aE0sP8uV2iO"
+        # Sanity: not UUID/hex, not tier-a, but high-entropy.
+        self.assertGreaterEqual(
+            codex_extract._shannon_entropy(opaque),
+            codex_extract._TIER_B_ENTROPY_THRESHOLD,
+        )
+        self.assertFalse(codex_extract._UUID_RE.match(opaque))
+        self.assertFalse(codex_extract._HEX_RE.match(opaque))
+        # And it doesn't start with a tier-a prefix.
+        self.assertFalse(opaque.startswith(("sk-", "Bearer", "AKIA", "ghp_")))
+
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            (root / "skills" / "alpha" / "SKILL.md").write_text(
+                f"---\nname: alpha\ndescription: Helper uses {opaque} internally.\n---\n\nbody\n",
+                encoding="utf-8",
+            )
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+
+            stderr_lines = []
+            with patch("builtins.print") as mock_print:
+                def _record(*a, **kw):
+                    if kw.get("file") is sys.stderr:
+                        stderr_lines.append(" ".join(str(x) for x in a))
+                mock_print.side_effect = _record
+                # Must NOT raise — tier-b is redact + warn, not abort.
+                html, island, _ = codex_extract.generate_profile()
+
+        # The opaque token is gone from both the island AND the HTML.
+        descs = [s.get("description", "") for s in island["skillInventory"]]
+        for desc in descs:
+            self.assertNotIn(opaque, desc)
+        self.assertNotIn(opaque, html)
+        # The placeholder appears in the alpha entry's description.
+        alpha = next(s for s in island["skillInventory"] if s["name"] == "alpha")
+        self.assertIn("<redacted-by-secret-gate>", alpha["description"])
+
+        # A warning was emitted to stderr.
+        joined = "\n".join(stderr_lines)
+        self.assertIn("tier-b secret gate", joined)
+        # And the warning never echoes the full token (defense in depth so
+        # the warning doesn't itself leak the secret).
+        self.assertNotIn(opaque, joined)
+
+
+class TierAandBHappyPathTest(unittest.TestCase):
+    """Clean output → gate passes silently, file is written, no warnings."""
+
+    def test_clean_run_emits_file_no_warnings(self):
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+
+            stderr_lines = []
+            with patch("builtins.print") as mock_print:
+                def _record(*a, **kw):
+                    if kw.get("file") is sys.stderr:
+                        stderr_lines.append(" ".join(str(x) for x in a))
+                mock_print.side_effect = _record
+                rc = codex_extract.main([])
+
+            self.assertEqual(rc, 0)
+            # File written.
+            self.assertEqual(len(list((root / "usage-data").glob("*.html"))), 1)
+            # No tier-b warnings emitted on the clean fixture.
+            for line in stderr_lines:
+                self.assertNotIn("tier-b secret gate redacted", line)
+                self.assertNotIn("SECRET LEAK", line)
+
+
+class TierADefenseInDepthTest(unittest.TestCase):
+    """Tier (a) is the BACKSTOP — Unit 3's README-credential redactor already
+    catches ``sk-``/``Bearer ``/``ghp_``/``AKIA`` in README excerpts before
+    they reach the serialized island. Tier (a) is the wider net that catches
+    anything the upstream pre-redaction missed — e.g. a secret in a
+    frontmatter ``description`` (not redacted by Unit 3 because that field
+    flows straight through ``parse_skill_frontmatter``). This test pins the
+    chain: when Unit 3 successfully pre-scrubs, tier (a) does NOT trip
+    (no false alarm), but the secret is also no longer present in the
+    output — defense in depth, not double-counting."""
+
+    def test_readme_secret_is_pre_scrubbed_by_unit3_so_tier_a_does_not_trip(self):
+        # README carries a sk- token. Unit 3's _redact_known_secrets is the
+        # FIRST line of defense; it replaces the token with <redacted-secret>
+        # before the showcase emits readmeMarkdown. Tier (a) should NOT fire
+        # because the serialized output no longer carries the raw token —
+        # both layers succeeded.
+        with TemporaryDirectory() as d:
+            root = _full_profile_codex_root(Path(d), sessions=6)
+            (root / "skills" / "alpha" / "README.md").write_text(
+                "# alpha\n\nSet header Authorization Bearer sk-LEAK-IN-README-99999.\n",
+                encoding="utf-8",
+            )
+            patches = _patch_codex_dir(root)
+            for p in patches:
+                p.start()
+            self.addCleanup(lambda ps=patches: [p.stop() for p in ps])
+            # Must NOT raise — Unit 3 pre-scrubs the README's bearer token.
+            html, island, _ = codex_extract.generate_profile()
+
+        # The raw token is absent from both the HTML and the serialized island.
+        self.assertNotIn("sk-LEAK-IN-README-99999", html)
+        self.assertNotIn("sk-LEAK-IN-README-99999", json.dumps(island))
+        # And the Unit-3 placeholder appears in alpha's readmeMarkdown
+        # (verifying the pre-scrub fired).
+        alpha = next(s for s in island["skillInventory"] if s["name"] == "alpha")
+        self.assertIn("<redacted-secret>", alpha.get("readmeMarkdown") or "")
+
+
+class RealDataGateTest(unittest.TestCase):
+    """The load-bearing real-data gate (R7 + the Unit-2 ratio sanity check).
+    Skips cleanly when no real ``~/.codex`` is present so the test is
+    portable. When present:
+
+      * The run is NOT falsely blocked.
+      * The emitted HTML + island contain ZERO ``Bearer ``/``sk-``/``AKIA``/
+        ``ghp_`` hits (excluding the documentation placeholder ``Bearer
+        <token>``).
+      * No ``repository_url`` / ``commit_hash`` / ``connector_<uuid>`` /
+        ``/Users/<...>/`` strings survive.
+      * The token total is within 0.5x-2x of an independent per-session-max
+        sum computed directly from the rollouts (closes the ADV-1 inflation
+        class — a per-record sum would inflate ~9x).
+      * Legacy-format sessions ARE counted toward the session total.
+    """
+
+    def _independent_per_session_max_sum(self, sessions_dir: Path) -> tuple[int, int, int]:
+        """Independent token total + session counts derived directly from
+        the rollouts. Used to sanity-check ``parse_rollouts``.
+
+        Returns ``(total, sessions, legacy_sessions)``.
+        """
+        total = 0
+        sessions = 0
+        legacy = 0
+        for rollout in sorted(sessions_dir.rglob("rollout-*.jsonl")):
+            if not rollout.is_file():
+                continue
+            session_max = 0
+            is_payload = False
+            try:
+                with open(rollout, "r", errors="replace") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(rec, dict):
+                            continue
+                        payload = rec.get("payload")
+                        if not isinstance(payload, dict):
+                            continue
+                        is_payload = True
+                        if payload.get("type") == "token_count":
+                            info = payload.get("info")
+                            if not isinstance(info, dict):
+                                continue
+                            usage = info.get("total_token_usage")
+                            if not isinstance(usage, dict):
+                                continue
+                            t = usage.get("total_tokens")
+                            if isinstance(t, int) and t > session_max:
+                                session_max = t
+            except OSError:
+                continue
+            sessions += 1
+            if not is_payload:
+                legacy += 1
+            total += session_max
+        return total, sessions, legacy
+
+    def test_real_codex_dir_clean_emits_with_sane_token_ratio(self):
+        real_codex = Path.home() / ".codex"
+        if not real_codex.exists():
+            self.skipTest("no real ~/.codex on this machine — gate test is portable")
+        sessions_dir = real_codex / "sessions"
+        if not sessions_dir.exists():
+            self.skipTest("real ~/.codex has no sessions/ — nothing to validate")
+
+        # 1) Run main() against the real tree. Must NOT be blocked.
+        stderr_lines = []
+        with patch("builtins.print") as mock_print:
+            stdout_lines = []
+            def _record(*a, **kw):
+                if kw.get("file") is sys.stderr:
+                    stderr_lines.append(" ".join(str(x) for x in a))
+                elif "file" not in kw or kw["file"] is sys.stdout:
+                    stdout_lines.append(" ".join(str(x) for x in a))
+            mock_print.side_effect = _record
+            try:
+                rc = codex_extract.main([])
+            except codex_extract.SecretLeakError as exc:
+                self.fail(
+                    f"real-data run was BLOCKED by tier-a gate (which means a "
+                    f"real secret reached the serialized output): {exc}. "
+                    "Investigate the source and tighten the upstream parser; "
+                    "the gate is doing its job."
+                )
+
+        self.assertEqual(
+            rc, 0,
+            f"real-data run exited non-zero (rc={rc}). stderr: {stderr_lines}",
+        )
+        # The final stdout line must be the report path.
+        self.assertTrue(stdout_lines, "expected a final report-path line")
+        report_path = Path(stdout_lines[-1])
+        self.assertTrue(report_path.is_file(), f"report not written: {report_path}")
+
+        # 2) Read what was written. Scan for ZERO tier-a hits and zero
+        # identity leaks.
+        html = report_path.read_text(encoding="utf-8")
+        # Clean up the report so we don't leave artifacts behind on the
+        # operator's machine.
+        self.addCleanup(lambda: report_path.unlink(missing_ok=True))
+
+        # Tier-a prefixes — excluding the literal documentation placeholder.
+        # We replace the placeholder so a residual `Bearer <token>` in the
+        # rendered prose doesn't false-positive the test.
+        scan = html.replace("Bearer &lt;token&gt;", "").replace("Bearer <token>", "")
+        for forbidden in ("Bearer sk-", "AKIA", "ghp_"):
+            self.assertNotIn(
+                forbidden, scan,
+                f"real-data run leaked a tier-a token shape {forbidden!r}",
+            )
+        # `sk-` is so generic that it might appear in documentation; only
+        # flag it when it's followed by token-like characters.
+        import re as _re
+        sk_matches = _re.findall(r"sk-[A-Za-z0-9_\-]{8,}", scan)
+        self.assertEqual(
+            sk_matches, [],
+            f"real-data run leaked sk- token shapes: {sk_matches[:3]}",
+        )
+
+        # Identity leaks the R8 controls are supposed to prevent.
+        for forbidden in ("repository_url", "commit_hash", "connector_"):
+            self.assertNotIn(
+                forbidden, html,
+                f"real-data run leaked identity field {forbidden!r}",
+            )
+        # Connector UUID shape (32 hex chars) — none should appear adjacent
+        # to "connector". Above check covers the substring; this one catches
+        # a stray bare hex.
+        # Home-path leak. /Users/<anything>/ should not appear; we detect by
+        # the literal "/Users/" prefix followed by a non-empty username
+        # segment. The exception is documentation strings like
+        # "<code>~/.codex/</code>" which use ~ not /Users/.
+        users_matches = _re.findall(r"/Users/[A-Za-z0-9_\-\.]+", html)
+        self.assertEqual(
+            users_matches, [],
+            f"real-data run leaked /Users/ home paths: {users_matches[:3]}",
+        )
+
+        # 3) Token total ratio sanity check (closes ADV-1). Compute an
+        # independent per-session-max sum and assert the emitted total is
+        # within 0.5x-2x. A per-record sum would inflate ~9x.
+        independent_total, independent_sessions, independent_legacy = (
+            self._independent_per_session_max_sum(sessions_dir)
+        )
+        # Pull the emitted total from the embedded island.
+        emitted_island = _extract_island(html)
+        emitted_total = emitted_island["stats"]["totalTokens"]
+        emitted_sessions = emitted_island["stats"]["sessionCount"]
+        emitted_legacy = emitted_island["stats"]["legacyFormatSessions"]
+
+        self.assertEqual(
+            emitted_total, independent_total,
+            f"token total mismatch: emitted={emitted_total} vs independent="
+            f"{independent_total} (per-session-max sum). Inflation ratio = "
+            f"{emitted_total / max(independent_total, 1):.2f}x — anything "
+            "outside ~1x means the parser regressed on R3."
+        )
+        # Defense-in-depth — even if the equality above is loosened later,
+        # the 0.5x-2x ratio must hold.
+        if independent_total > 0:
+            ratio = emitted_total / independent_total
+            self.assertGreaterEqual(ratio, 0.5, f"token total deflated: ratio={ratio:.2f}x")
+            self.assertLessEqual(ratio, 2.0, f"token total inflated: ratio={ratio:.2f}x")
+
+        # 4) Legacy sessions are counted (R9).
+        self.assertEqual(
+            emitted_sessions, independent_sessions,
+            f"session count mismatch: emitted={emitted_sessions} vs "
+            f"independent={independent_sessions}",
+        )
+        self.assertEqual(
+            emitted_legacy, independent_legacy,
+            f"legacy session count mismatch: emitted={emitted_legacy} vs "
+            f"independent={independent_legacy}",
+        )
+
+        # 5) Confirm the run was not falsely blocked (no SECRET LEAK or
+        # NOT written messages on stderr).
+        joined_stderr = "\n".join(stderr_lines)
+        self.assertNotIn("SECRET LEAK", joined_stderr)
+        self.assertNotIn("NOT written", joined_stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

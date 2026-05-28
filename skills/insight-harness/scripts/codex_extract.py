@@ -1341,15 +1341,329 @@ def render_html(profile: dict, island: dict) -> str:
     )
 
 
+# --- Unit 6 — two-tier emit-time secret gate (R7) ----------------------------
+# The positive read-allowlist (R5), structured rule/command parsing (R4/R6), and
+# identity scrubbing (R8) are the PRIMARY controls. This gate is the BACKSTOP:
+# it scans the SERIALIZED output (HTML string + island JSON string) before any
+# write hits disk. Two tiers, deliberately:
+#
+#   * TIER (a) — UNAMBIGUOUS TOKEN PREFIXES (`sk-`, `Bearer `, `AKIA`, `ghp_`):
+#     a hit is a real credential leak with negligible false-positive risk, so
+#     we FAIL LOUD — raise ``SecretLeakError``, alert stderr, exit non-zero,
+#     and leave the disk untouched. ``Bearer `` is required to be followed by
+#     a non-``<`` character so documentation placeholders like
+#     ``Authorization: Bearer <token>`` do not trip the gate.
+#
+#   * TIER (b) — HIGH-ENTROPY HEURISTIC, SCOPED TO POST-ALLOWLIST TEXT:
+#     a Shannon-entropy threshold over token runs of length >= 20, applied ONLY
+#     to (i) the textual ``description`` / ``readmeMarkdown`` fields in the
+#     island and (ii) the rendered HTML PROSE body content. Explicitly excludes
+#     already-budgeted high-entropy content the plan intends to emit:
+#     hero-image data URIs (the ``data:image/...;base64,...`` blob in
+#     ``heroBase64``), skill ``installPointer`` / ID values, and hash/UUID-like
+#     strings. A hit redacts the offending field to a placeholder and emits a
+#     stderr warning; the run CONTINUES with the redacted output written.
+#
+# The two-tier split is load-bearing: a single fail-loud entropy gate would
+# block benign harnesses (hero data URIs + skill IDs would trip it) so its
+# threshold would inevitably be loosened until it missed real tokens, or it
+# would block every profile from generating. Splitting unambiguous-prefix from
+# entropic gives us a real abort on the cases that warrant it and a graceful
+# redaction on the case where false positives are likely.
+
+
+class SecretLeakError(RuntimeError):
+    """Raised by the tier-a secret gate when an unambiguous credential prefix
+    (``sk-``, ``Bearer ``, ``AKIA``, ``ghp_``) reaches the serialized output.
+
+    On this error the report file is NOT written. The caller (``main``) catches
+    it, emits a stderr alert, and exits non-zero — failing the run is the
+    correct response because these prefixes do not produce false positives.
+    """
+
+
+# Tier (a) — unambiguous token-prefix patterns. ``Bearer `` requires a
+# non-``<`` character after the space so documentation placeholders like
+# ``Bearer <token>`` are not flagged. The other prefixes are followed by a
+# typical token-character run (>= 8 chars) to avoid matching the bare prefix in
+# documentation prose. These prefixes are intentionally narrow and high-signal.
+_TIER_A_PATTERNS = (
+    ("sk-",     re.compile(r"sk-[A-Za-z0-9_\-]{8,}")),
+    ("Bearer",  re.compile(r"Bearer\s+[A-Za-z0-9_\-][A-Za-z0-9_\-\.=/+]{4,}")),
+    ("AKIA",    re.compile(r"AKIA[A-Za-z0-9]{8,}")),
+    ("ghp_",    re.compile(r"ghp_[A-Za-z0-9]{8,}")),
+)
+
+# Tier (b) — Shannon entropy threshold + minimum run length. Token runs are
+# contiguous spans of [A-Za-z0-9_\-+/=] (covers base64, base64url, hex, and
+# typical opaque-token shapes); we measure their character entropy. A length
+# floor of 20 keeps short identifiers (UUIDs without dashes are 32 hex chars
+# — see UUID-shape allowlist below) out of the candidate set unless they are
+# truly opaque. Threshold 4.5 bits/char is what real opaque tokens hit;
+# English prose runs ~2.5-3.5, hex/UUIDs ~3.5-4.0, base64 IDs ~4.5-5.5.
+_TIER_B_MIN_RUN = 20
+_TIER_B_ENTROPY_THRESHOLD = 4.5
+_TIER_B_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-+/=]{20,}")
+
+# UUID-shape allowlist for tier (b). UUIDs with or without dashes are by
+# construction high-entropy hex strings; the safety extractor already strips
+# the connector-UUID SECTION KEY, and any UUID that reaches a text field is
+# almost certainly a benign skill/install identifier, not a credential.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?"
+    r"[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$"
+)
+# Pure-hex runs (commit hashes, content hashes) — also benign-by-shape.
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+_TIER_B_REDACTED = "<redacted-by-secret-gate>"
+
+
+def _shannon_entropy(s: str) -> float:
+    """Shannon entropy (bits per character) of ``s``. 0.0 for an empty string.
+
+    A high-entropy random run hits >= 4.5; English text and structured
+    identifiers stay well below.
+    """
+    if not s:
+        return 0.0
+    import math
+    counts: dict[str, int] = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(s)
+    h = 0.0
+    for c in counts.values():
+        p = c / n
+        h -= p * math.log2(p)
+    return h
+
+
+def _is_entropy_allowlisted(token: str) -> bool:
+    """True iff a high-entropy token matches a shape the plan intends to emit.
+
+    Excludes hero-image data URIs (we don't scan those at all — see the caller),
+    UUIDs (with or without dashes — benign install/skill identifiers), and
+    pure-hex runs (content hashes, commit hashes — already stripped from
+    identity-bearing positions by R8 but harmless when they slip into a text
+    field). Returns True so the caller passes the token through without
+    redacting.
+    """
+    if _UUID_RE.match(token):
+        return True
+    if _HEX_RE.match(token):
+        return True
+    return False
+
+
+def _scan_tier_a(serialized: str, source_label: str) -> None:
+    """Raise ``SecretLeakError`` if the SERIALIZED output contains an
+    unambiguous credential prefix. ``source_label`` is included in the error
+    message so the operator can tell whether the leak was in the HTML or the
+    island JSON.
+    """
+    for prefix, pat in _TIER_A_PATTERNS:
+        m = pat.search(serialized)
+        if m:
+            # Truncate the matched run in the error so the leak does not echo
+            # to stderr verbatim (a sensible posture even though stderr is
+            # local-only). The label + prefix are enough for an operator to
+            # locate the source.
+            hit = m.group(0)
+            snippet = hit[:8] + "..." if len(hit) > 11 else hit
+            raise SecretLeakError(
+                f"tier-a secret gate: {prefix!r} prefix found in {source_label} "
+                f"({snippet!r}); the report was NOT written."
+            )
+
+
+def _redact_tier_b_in_text(text: str) -> tuple[str, list[str]]:
+    """Return ``(redacted_text, hits)``. Replaces every high-entropy token run
+    that is NOT shape-allowlisted with ``<redacted-by-secret-gate>``.
+
+    Empty / None-ish input returns unchanged. ``hits`` lists the redacted-run
+    summaries (length + first 4 chars) for the stderr warning; the full run is
+    never returned.
+    """
+    if not text:
+        return text, []
+    hits: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        token = match.group(0)
+        if _is_entropy_allowlisted(token):
+            return token
+        if _shannon_entropy(token) < _TIER_B_ENTROPY_THRESHOLD:
+            return token
+        hits.append(f"len={len(token)} starts={token[:4]!r}")
+        return _TIER_B_REDACTED
+
+    redacted = _TIER_B_TOKEN_RE.sub(_replace, text)
+    return redacted, hits
+
+
+def _redact_tier_b_in_island(island: dict) -> tuple[dict, list[str]]:
+    """Walk the textual fields of the island and redact high-entropy tokens.
+
+    Scope (R7 tier-b): ONLY the ``description`` and ``readmeMarkdown`` fields of
+    each ``skillInventory`` entry. ``heroBase64`` (the data-URI blob), ``name``,
+    ``installPointer``, and every other field — including the entire ``stats`` /
+    ``safety`` / ``toolUsage`` / ``cliTools`` tree — are NOT scanned, because
+    they are either intentionally high-entropy (hero image, install IDs) or
+    already constrained to enums / counts / first-token binaries by upstream
+    parsers.
+
+    Returns a tuple of ``(redacted_island, hit_summaries)``. ``hit_summaries``
+    is a list of human-readable strings the caller logs to stderr; it never
+    contains the full unredacted token.
+    """
+    summaries: list[str] = []
+    # Shallow-copy the dict so we don't mutate the caller's reference;
+    # skillInventory is the only list we touch and we rebuild its entries.
+    new_island = dict(island)
+    skills = new_island.get("skillInventory")
+    if not isinstance(skills, list):
+        return new_island, summaries
+
+    new_skills = []
+    for entry in skills:
+        if not isinstance(entry, dict):
+            new_skills.append(entry)
+            continue
+        new_entry = dict(entry)
+        for field in ("description", "readmeMarkdown"):
+            val = new_entry.get(field)
+            if isinstance(val, str) and val:
+                redacted, hits = _redact_tier_b_in_text(val)
+                if hits:
+                    summaries.extend(
+                        f"skill {new_entry.get('name', '?')!r}.{field}: {h}"
+                        for h in hits
+                    )
+                    new_entry[field] = redacted
+        new_skills.append(new_entry)
+    new_island["skillInventory"] = new_skills
+    return new_island, summaries
+
+
+# Matches <script>...</script> and <style>...</style> blocks so the HTML
+# prose-text scan can excise them (script bodies carry the serialized island
+# JSON, which we scan separately; style bodies are CSS, not prose).
+_SCRIPT_OR_STYLE_RE = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL
+)
+# Matches an HTML tag — used to strip markup so we get the textual body.
+_TAG_RE = re.compile(r"<[^>]+>")
+# data:...;base64,XXXX — already-budgeted high-entropy content (hero images);
+# excise before the entropy scan so the showcase pipeline's hero blob does not
+# false-positive the gate.
+_DATA_URI_RE = re.compile(r"data:[\w/+\-]+;base64,[A-Za-z0-9+/=]+")
+
+
+def _html_prose_text(html: str) -> str:
+    """Return the rough textual body of ``html`` with script/style blocks and
+    data: URIs excised, then tags stripped. This is what the tier-b entropy
+    scan operates on — NOT the raw HTML, because the raw HTML includes the
+    embedded JSON island and intentional high-entropy hero data URIs that
+    would false-positive the gate.
+    """
+    no_script = _SCRIPT_OR_STYLE_RE.sub(" ", html)
+    no_data_uri = _DATA_URI_RE.sub(" ", no_script)
+    text_only = _TAG_RE.sub(" ", no_data_uri)
+    return text_only
+
+
+def _scan_serialized_output(html: str, island: dict) -> tuple[str, dict, list[str]]:
+    """The full two-tier emit gate. Runs over the SERIALIZED output (HTML
+    string + island JSON string) BEFORE the file is written.
+
+    Returns ``(html, island, warnings)`` — the (possibly redacted) HTML and
+    island and the list of tier-b warning strings to log. Raises
+    ``SecretLeakError`` if tier (a) trips on either serialization.
+
+    Order of operations (the order matters):
+
+      1. TIER (a) FIRST — scan the ORIGINAL serialized HTML and the ORIGINAL
+         serialized island JSON for the unambiguous credential prefixes. If
+         we ran tier (b) first, a high-entropy token like ``ghp_FAKE...``
+         would be redacted before tier (a) saw it and the run would silently
+         continue with a written file — exactly the wrong outcome. Tier (a)
+         is the fail-loud signal; it must observe the raw serialization.
+      2. Tier (b) redaction over the island's text fields. If anything was
+         redacted, the HTML is updated so the redaction propagates to the
+         page body too.
+      3. Tier (b) redaction over the HTML prose text (excluding script/style
+         and data URIs). Catches high-entropy runs that survived in prose
+         that wasn't sourced from the island (e.g. future prose helpers).
+    """
+    warnings: list[str] = []
+
+    # Step 1: tier-a on the ORIGINAL HTML and the ORIGINAL serialized island.
+    # A hit here is a real credential leak — fail loud BEFORE any redaction.
+    original_island_serialized = json.dumps(island, separators=(",", ":"))
+    _scan_tier_a(html, "rendered HTML")
+    _scan_tier_a(original_island_serialized, "island JSON")
+
+    # Step 2: tier-b on island text fields. Propagate redactions into the
+    # rendered HTML so the page reflects the field-level redaction.
+    redacted_island, island_hits = _redact_tier_b_in_island(island)
+    warnings.extend(island_hits)
+    if island_hits:
+        for entry, orig_entry in zip(redacted_island["skillInventory"], island["skillInventory"]):
+            if not isinstance(entry, dict) or not isinstance(orig_entry, dict):
+                continue
+            for field in ("description", "readmeMarkdown"):
+                orig = orig_entry.get(field)
+                new = entry.get(field)
+                if isinstance(orig, str) and isinstance(new, str) and orig != new:
+                    # Replace the original-text fragments wherever they appear
+                    # in the HTML (HTML-escaped form too, just in case).
+                    html = html.replace(orig, new)
+                    html = html.replace(_html_lib.escape(orig, quote=True), new)
+
+    # Step 3: tier-b on HTML prose body (script + style + data URIs already
+    # excluded). If a high-entropy token survived in prose that wasn't from
+    # the island fields, replace it directly in the rendered HTML.
+    prose = _html_prose_text(html)
+    _, prose_hits_raw = _redact_tier_b_in_text(prose)
+    if prose_hits_raw:
+        # Re-derive the actual token strings so we can substitute them in the
+        # HTML directly (the hit summary only carries a fingerprint).
+        for match in _TIER_B_TOKEN_RE.finditer(prose):
+            tok = match.group(0)
+            if _is_entropy_allowlisted(tok):
+                continue
+            if _shannon_entropy(tok) < _TIER_B_ENTROPY_THRESHOLD:
+                continue
+            warnings.append(f"html prose: len={len(tok)} starts={tok[:4]!r}")
+            html = html.replace(tok, _TIER_B_REDACTED)
+
+    return html, redacted_island, warnings
+
+
 def generate_profile(include_skills: bool = True) -> tuple[str, dict, dict]:
-    """End-to-end: assemble, build the island, render the HTML.
+    """End-to-end: assemble, build the island, render the HTML, then run the
+    Unit-6 two-tier secret gate over the SERIALIZED output.
 
     Returns ``(html, island, profile)`` so tests can assert against the
-    structured island AND the rendered HTML without re-parsing the page.
+    structured island AND the rendered HTML without re-parsing the page. The
+    returned ``html`` / ``island`` have already passed the gate (and may carry
+    tier-b redactions); on a tier-a hit the gate raises ``SecretLeakError``
+    and the caller (``main``) does not write the report.
     """
     profile = assemble_profile(include_skills=include_skills)
     island = build_island(profile)
     html = render_html(profile, island)
+    # The gate is the LAST step before the caller writes. It runs over the
+    # serialized HTML and the serialized island JSON exactly as they will hit
+    # disk — there is no post-gate rewrite that could re-introduce a leak.
+    html, island, warnings = _scan_serialized_output(html, island)
+    for w in warnings:
+        print(
+            f"codex_extract: tier-b secret gate redacted a high-entropy run "
+            f"({w}); the field was replaced with {_TIER_B_REDACTED!r}.",
+            file=sys.stderr,
+        )
     return html, island, profile
 
 
@@ -1374,7 +1688,24 @@ def main(argv=None) -> int:
         return 0
 
     print("Generating Codex profile...", file=sys.stderr)
-    html, _island, _profile = generate_profile(include_skills=args.include_skills)
+    try:
+        html, _island, _profile = generate_profile(include_skills=args.include_skills)
+    except SecretLeakError as exc:
+        # Tier (a) — unambiguous credential prefix reached the serialized
+        # output. The disk is intentionally untouched; the operator must
+        # investigate the source (a leaked token in a SKILL.md README, a
+        # planted text field, or a parser regression) before retrying.
+        print(
+            f"codex_extract: SECRET LEAK DETECTED — {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "codex_extract: the report was NOT written. Inspect the offending "
+            "source (likely a ~/.codex/skills/*/README.md or a config field) "
+            "and retry once the credential is removed.",
+            file=sys.stderr,
+        )
+        return 2
 
     CODEX_USAGE_DATA_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now().strftime("%Y-%m-%d")
