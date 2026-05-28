@@ -148,6 +148,39 @@ The token is persisted at `~/.claude/insight-harness/config.json` with file mode
 
 Optional `--confirm` adds an interactive `[y/N]` prompt before the POST. In a non-TTY context (which is how Claude Code's background Bash invocations look), `--confirm` short-circuits: the skill saves locally, emits `LOCAL: <path>` as the final stdout line, and exits 0 without POSTing.
 
+## Codex profile (Phase 1, local-only)
+
+A companion extractor profiles **OpenAI Codex CLI** usage from `~/.codex/` in the same shape as the Claude profile above — same privacy posture, same showcase pipeline, same output contract. Phase 1 is **local generation only**: no `--publish`, no upload to insightharness.com, no schema change to the Claude pipeline. Publishing arrives in Phase 2 (the combined tool-selector profile).
+
+### Required invocation
+
+Same background-Bash pattern as the Claude invocation — the extractor walks every rollout under `~/.codex/sessions/**/rollout-*.jsonl` (both the 2026 payload-envelope format and the 2025 legacy format) and can take a minute or two on heavy histories:
+
+```bash
+python3 ~/.claude/skills/insight-harness/scripts/codex_extract.py --include-skills > /tmp/codex-extract.log 2>&1
+```
+
+Pass `run_in_background: true` to the Bash tool. The final stdout line is the absolute path to the generated HTML at `~/.codex/usage-data/<date>-codex-harness.html` — open it the same way you open the Claude report:
+
+```bash
+open "<absolute-path-from-the-final-stdout-line>"
+```
+
+Pass `--no-include-skills` to skip per-skill READMEs and heroes for a smaller report.
+
+### Exit codes
+
+- **0** — success; the report path is the final stdout line.
+- **2** — the **secret gate** caught a known token prefix (`sk-`, `Bearer ...`, `AKIA`, `ghp_`) in the serialized output and refused to write the file. The stderr explains where; nothing was written to disk. This is the load-bearing privacy backstop — investigate before retrying.
+
+### Local-only limit (state it on the artifact)
+
+Codex desktop-app, mobile, web, and Cowork activity is server-side and **not** captured locally. The profile measures the locally-visible CLI surface only. A user who runs Codex mostly on mobile will show a thin local profile and the report says so prominently ("local CLI data only — this person may use Codex more elsewhere"). Below the activity floor (≥5 sessions OR ≥50k tokens), only the slim shell + caveat renders, not the full profile.
+
+### Codex-specific section set
+
+The Codex profile renders: Tokens, Tool Usage, CLI Commands, Skills (inventory-only — Codex loads skills into context, so there's no reliable per-skill invocation count), Plugins (from `config.toml` `[plugins.*]`), Safety & Automation (`approvals_reviewer` / `approval_mode` / `trust_level` enums + the `rules` allowlist as binary names only), Workflow Phases, and Work Surfaces. Claude-only sections (Hooks, Agent Dispatch, Plugin Ecosystem, Memory Architecture, Permission Accumulation, /insights tab) are intentionally omitted.
+
 ## Updating
 
 The skill checks for updates automatically when you run it. To update manually:

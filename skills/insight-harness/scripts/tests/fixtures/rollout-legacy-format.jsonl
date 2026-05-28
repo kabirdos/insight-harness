@@ -1,0 +1,5 @@
+{"timestamp":"2026-03-01T09:00:00.000Z","type":"session_meta","id":"019a0001-0000-7900-bf6b-bbbbbbbbbbbb","cwd":"/Users/exampleuser/Coding/legacy-project","cli_version":"0.21.0","git":{"repository_url":"git@github.com:exampleuser/legacy-project.git","branch":"main"}}
+{"timestamp":"2026-03-01T09:00:05.000Z","type":"user_message","message":"add a changelog entry"}
+{"timestamp":"2026-03-01T09:00:10.000Z","type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"git log --oneline -5\"]}","call_id":"call_legacy_1"}
+{"timestamp":"2026-03-01T09:00:11.000Z","type":"function_call_output","call_id":"call_legacy_1","output":"abc123 first\ndef456 second"}
+{"timestamp":"2026-03-01T09:01:00.000Z","type":"message","role":"assistant","content":"Done — added the changelog entry."}
