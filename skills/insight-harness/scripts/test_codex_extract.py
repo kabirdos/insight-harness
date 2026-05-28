@@ -1752,6 +1752,14 @@ class RealDataGateTest(unittest.TestCase):
         if not sessions_dir.exists():
             self.skipTest("real ~/.codex has no sessions/ — nothing to validate")
 
+        # The real ~/.codex tree is live while Codex is running these tests.
+        # Capture a before/after window so active-session token_count appends
+        # do not make the parser look wrong merely because the independent scan
+        # observed a slightly newer filesystem state.
+        before_total, before_sessions, before_legacy = (
+            self._independent_per_session_max_sum(sessions_dir)
+        )
+
         # 1) Run main() against the real tree. Must NOT be blocked.
         stderr_lines = []
         with patch("builtins.print") as mock_print:
@@ -1828,7 +1836,7 @@ class RealDataGateTest(unittest.TestCase):
         # 3) Token total ratio sanity check (closes ADV-1). Compute an
         # independent per-session-max sum and assert the emitted total is
         # within 0.5x-2x. A per-record sum would inflate ~9x.
-        independent_total, independent_sessions, independent_legacy = (
+        after_total, after_sessions, after_legacy = (
             self._independent_per_session_max_sum(sessions_dir)
         )
         # Pull the emitted total from the embedded island.
@@ -1837,30 +1845,48 @@ class RealDataGateTest(unittest.TestCase):
         emitted_sessions = emitted_island["stats"]["sessionCount"]
         emitted_legacy = emitted_island["stats"]["legacyFormatSessions"]
 
-        self.assertEqual(
-            emitted_total, independent_total,
-            f"token total mismatch: emitted={emitted_total} vs independent="
-            f"{independent_total} (per-session-max sum). Inflation ratio = "
-            f"{emitted_total / max(independent_total, 1):.2f}x — anything "
+        low_total, high_total = sorted((before_total, after_total))
+        self.assertGreaterEqual(
+            emitted_total, low_total,
+            f"token total below live-data window: emitted={emitted_total}, "
+            f"before={before_total}, after={after_total}",
+        )
+        self.assertLessEqual(
+            emitted_total, high_total,
+            f"token total above live-data window: emitted={emitted_total}, "
+            f"before={before_total}, after={after_total}. Inflation ratio = "
+            f"{emitted_total / max(after_total, 1):.2f}x — anything far "
             "outside ~1x means the parser regressed on R3."
         )
         # Defense-in-depth — even if the equality above is loosened later,
         # the 0.5x-2x ratio must hold.
-        if independent_total > 0:
-            ratio = emitted_total / independent_total
+        if after_total > 0:
+            ratio = emitted_total / after_total
             self.assertGreaterEqual(ratio, 0.5, f"token total deflated: ratio={ratio:.2f}x")
             self.assertLessEqual(ratio, 2.0, f"token total inflated: ratio={ratio:.2f}x")
 
         # 4) Legacy sessions are counted (R9).
-        self.assertEqual(
-            emitted_sessions, independent_sessions,
-            f"session count mismatch: emitted={emitted_sessions} vs "
-            f"independent={independent_sessions}",
+        low_sessions, high_sessions = sorted((before_sessions, after_sessions))
+        self.assertGreaterEqual(
+            emitted_sessions, low_sessions,
+            f"session count below live-data window: emitted={emitted_sessions}, "
+            f"before={before_sessions}, after={after_sessions}",
         )
-        self.assertEqual(
-            emitted_legacy, independent_legacy,
-            f"legacy session count mismatch: emitted={emitted_legacy} vs "
-            f"independent={independent_legacy}",
+        self.assertLessEqual(
+            emitted_sessions, high_sessions,
+            f"session count above live-data window: emitted={emitted_sessions}, "
+            f"before={before_sessions}, after={after_sessions}",
+        )
+        low_legacy, high_legacy = sorted((before_legacy, after_legacy))
+        self.assertGreaterEqual(
+            emitted_legacy, low_legacy,
+            f"legacy session count below live-data window: emitted={emitted_legacy}, "
+            f"before={before_legacy}, after={after_legacy}",
+        )
+        self.assertLessEqual(
+            emitted_legacy, high_legacy,
+            f"legacy session count above live-data window: emitted={emitted_legacy}, "
+            f"before={before_legacy}, after={after_legacy}",
         )
 
         # 5) Confirm the run was not falsely blocked (no SECRET LEAK or
