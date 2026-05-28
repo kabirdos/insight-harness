@@ -482,6 +482,189 @@ def extract_plugins_from_config() -> list[dict]:
     return entries
 
 
+# --- Safety posture (Unit 4, R4/R8) ------------------------------------------
+# Codex's safety/automation posture lives in two places (verified against the
+# real ~/.codex):
+#
+#   config.toml
+#     approvals_reviewer = "user"                     # top-level enum
+#     [projects."/Users/<me>/Coding/proj"]            # ← ABSOLUTE-PATH section
+#     trust_level = "trusted"                          #    key is a LEAK; read
+#                                                      #    only the VALUE below.
+#     [apps.connector_<uuid>.tools.<tool>]            # ← connector UUID section
+#     approval_mode = "approve"                        #    key is a LEAK + would
+#                                                      #    trip the Unit-6 entropy
+#                                                      #    gate; read only VALUE.
+#   rules/*.rules
+#     prefix_rule(pattern=["git", "add", "<path>"], decision="allow")
+#       ↑ a STRUCTURED DSL, not a shell string. Later pattern elements routinely
+#         carry absolute home-dir paths AND Bearer tokens (the real default.rules
+#         has `["/bin/zsh","-lc","curl ... Authorization: Bearer $(...auth.json)"]`).
+#         We extract pattern[0] (the binary) ONLY and discard EVERYTHING after it
+#         plus the decision. extract_safe_command_name is a bash-STRING tokenizer
+#         and is the wrong tool here, so we do not feed rule lines to it.
+#
+# The emitted shape is enums + binaries only:
+#   {rulesAllowlist:[binaries], approvalsReviewer, approvalModes:[enums],
+#    trustLevels:[enums]}
+# Never the project-path section keys, never the connector UUID section key.
+
+# Matches the `pattern=[ ... ]` list literal inside a prefix_rule(...) call. We
+# capture the bracketed body and JSON-parse it so we read element [0] structurally
+# rather than string-slicing (which could accidentally surface a later element).
+# Non-greedy up to the first closing bracket; rule patterns are single-line in the
+# real DSL (one prefix_rule per line).
+_PREFIX_RULE_PATTERN_RE = re.compile(r"pattern\s*=\s*(\[[^\]]*\])")
+
+
+def _rule_binary(line: str):
+    """Extract ``pattern[0]`` (the binary) from ONE ``prefix_rule(...)`` line.
+
+    Returns the first pattern element as a string, or ``None`` if the line is not
+    a well-formed ``prefix_rule`` with a non-empty string pattern[0]. EVERY later
+    pattern element and the ``decision`` are discarded and never read — this is
+    the load-bearing privacy control, because later elements carry absolute paths
+    and Bearer tokens in the real rules file.
+
+    We only honor ``prefix_rule`` (allow-list rules); ``deny_rule`` and other DSL
+    forms are ignored so we never surface a binary that was actually denied.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("prefix_rule"):
+        return None
+    m = _PREFIX_RULE_PATTERN_RE.search(stripped)
+    if not m:
+        return None
+    try:
+        # The DSL uses JSON-compatible array syntax (double-quoted strings), so
+        # json.loads parses the bracketed body directly.
+        pattern = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(pattern, list) or not pattern:
+        return None
+    first = pattern[0]
+    # pattern[0] must be a non-empty string. It MAY be an absolute binary path
+    # (e.g. "/bin/zsh") — that is the program, not a leaked argument — but it must
+    # be a single token with no embedded whitespace (a multi-token pattern[0]
+    # would mean a malformed rule, not a real binary).
+    if not isinstance(first, str):
+        return None
+    first = first.strip()
+    if not first or any(c.isspace() for c in first):
+        return None
+    return first
+
+
+def parse_rules_allowlist() -> list[dict]:
+    """Parse every ``*.rules`` file under ``CODEX_RULES_DIR`` and return the
+    deduped sorted list of allow-rule BINARIES (``pattern[0]`` only).
+
+    Returns ``[]`` when the rules dir is absent/empty. Reads the dir at call time
+    so a test ``patch.object`` is honored. Only ``pattern[0]`` of each
+    ``prefix_rule`` is ever materialized — later elements (paths/tokens) and the
+    ``decision`` are dropped inside ``_rule_binary`` and never reach this list.
+    """
+    rules_dir = CODEX_RULES_DIR
+    if not rules_dir.exists():
+        return []
+
+    binaries: set[str] = set()
+    for rule_file in sorted(rules_dir.glob("*.rules")):
+        if not rule_file.is_file():
+            continue
+        try:
+            with open(rule_file, "r", errors="replace") as fh:
+                for line in fh:
+                    binary = _rule_binary(line)
+                    if binary:
+                        binaries.add(binary)
+        except OSError:
+            continue
+    return sorted(binaries)
+
+
+def _collect_approval_modes(apps_table) -> list[str]:
+    """Walk an ``[apps.*]`` config subtree and collect ``approval_mode`` VALUES.
+
+    Reads ONLY the ``approval_mode`` leaf value wherever it appears in the nested
+    ``[apps.connector_<uuid>.tools.<tool>]`` structure. The connector-UUID section
+    KEY and the tool name are never read or emitted (they are an identity leak and
+    the UUID would trip the Unit-6 entropy gate). Returns a deduped sorted list.
+    """
+    modes: set[str] = set()
+
+    def _walk(node):
+        if not isinstance(node, dict):
+            return
+        for key, val in node.items():
+            if key == "approval_mode" and isinstance(val, str) and val:
+                modes.add(val)
+            elif isinstance(val, dict):
+                # Recurse into nested tables (connector_<uuid>, .tools, .<tool>)
+                # WITHOUT ever reading `key` itself — the UUID stays unread.
+                _walk(val)
+
+    _walk(apps_table)
+    return sorted(modes)
+
+
+def _collect_trust_levels(projects_table) -> list[str]:
+    """Collect distinct ``trust_level`` VALUES from the ``[projects.*]`` subtree.
+
+    The ``[projects."<absolute-path>"]`` section KEYS are absolute home-dir /
+    project-name leaks and are NEVER read — we iterate only ``.values()`` and read
+    the ``trust_level`` enum beneath each. Returns a deduped sorted list, so the
+    project COUNT and per-project shape are not revealed either.
+    """
+    levels: set[str] = set()
+    if not isinstance(projects_table, dict):
+        return []
+    # NOTE: iterate values() only — the keys are the absolute paths we must drop.
+    for body in projects_table.values():
+        if isinstance(body, dict):
+            level = body.get("trust_level")
+            if isinstance(level, str) and level:
+                levels.add(level)
+    return sorted(levels)
+
+
+def extract_safety_posture() -> dict:
+    """Produce the Codex 'Safety & Automation' data — enums + binaries only (R4).
+
+    Returns::
+
+        {
+          "rulesAllowlist":   [binaries],   # pattern[0] of each prefix_rule
+          "approvalsReviewer": "<enum>"|None,  # top-level approvals_reviewer
+          "approvalModes":    [enums],       # per-app approval_mode VALUES
+          "trustLevels":      [enums],       # per-project trust_level VALUES
+        }
+
+    NEVER emits the ``[projects."<path>"]`` section keys (home-dir/project-name
+    leaks) and NEVER reads the ``[apps.connector_<uuid>]`` section key (the
+    connector UUID — only the ``approval_mode`` value beneath it). Degrades to
+    empty structures / ``None`` when config or rules are absent (the renderer
+    shows "none configured").
+    """
+    config = _load_config_toml()
+
+    reviewer = config.get("approvals_reviewer")
+    if not isinstance(reviewer, str) or not reviewer:
+        reviewer = None
+
+    approval_modes = _collect_approval_modes(config.get("apps"))
+    trust_levels = _collect_trust_levels(config.get("projects"))
+    rules_allowlist = parse_rules_allowlist()
+
+    return {
+        "rulesAllowlist": rules_allowlist,
+        "approvalsReviewer": reviewer,
+        "approvalModes": approval_modes,
+        "trustLevels": trust_levels,
+    }
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Argparse skeleton for the Codex extractor.
 

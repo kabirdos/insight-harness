@@ -657,5 +657,244 @@ class CodexPluginsFromConfigTest(unittest.TestCase):
                 self.assertEqual(codex_extract.extract_plugins_from_config(), [])
 
 
+def _write_config(root: Path, body: str) -> Path:
+    """Write ``config.toml`` under a temp Codex ``root`` and return its path."""
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "config.toml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _write_rules(root: Path, files: dict[str, str]) -> Path:
+    """Create ``rules/<name>.rules`` files under a temp Codex ``root`` and return
+    the rules dir. ``files`` maps a filename (e.g. ``default.rules``) to its
+    contents."""
+    rules_dir = root / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    for fname, contents in files.items():
+        (rules_dir / fname).write_text(contents, encoding="utf-8")
+    return rules_dir
+
+
+class CodexRulesLeakTest(unittest.TestCase):
+    """LOAD-BEARING SECURITY ASSERTION (R4/R8). The real ``*.rules`` DSL embeds
+    absolute credential-file paths and Bearer tokens in LATER ``pattern`` elements
+    (verified against the real ~/.codex/rules/default.rules). The parser must emit
+    ``pattern[0]`` (the binary) ONLY and discard every later element + the
+    ``decision``. Nothing path-like (``/``, ``~``, ``/Users/``) and no token may
+    ever reach the safety output."""
+
+    def test_rule_with_credential_path_and_bearer_token_emits_binary_only(self):
+        rules = (
+            # A rule whose later pattern elements are an absolute creds-file path.
+            'prefix_rule(pattern=["git", "add", '
+            '"/Users/someone/Library/Application Support/com.vercel.cli/auth.json"], '
+            'decision="allow")\n'
+            # A rule whose later element embeds a live-looking Bearer token.
+            'prefix_rule(pattern=["curl", "-H", '
+            '"Authorization: Bearer sk-FAKE-LEAK-9999"], decision="allow")\n'
+        )
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _write_rules(root, {"default.rules": rules})
+            with patch.object(codex_extract, "CODEX_RULES_DIR", root / "rules"), \
+                 patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                safety = codex_extract.extract_safety_posture()
+
+        allowlist = safety["rulesAllowlist"]
+        # The binaries (pattern[0]) ARE surfaced.
+        self.assertIn("git", allowlist)
+        self.assertIn("curl", allowlist)
+
+        # NOTHING else from the rule may survive. Scan the FULL serialized safety
+        # output — the island scans the serialized string (R11), so this is the
+        # exact surface that would ship.
+        blob = json.dumps(safety)
+        # The credentials path and every path-like fragment of it.
+        self.assertNotIn("auth.json", blob)
+        self.assertNotIn("com.vercel.cli", blob)
+        self.assertNotIn("/Users/someone", blob)
+        self.assertNotIn("Application Support", blob)
+        # The token, the auth scheme, and the header carrier.
+        self.assertNotIn("sk-FAKE-LEAK-9999", blob)
+        self.assertNotIn("Bearer", blob)
+        self.assertNotIn("Authorization", blob)
+        # The DSL's own non-binary noise must not leak either.
+        self.assertNotIn("decision", blob)
+        self.assertNotIn("allow", blob)
+
+        # And the structural guarantee: no allowlist binary contains a path-like
+        # character (defense beyond the substring checks above).
+        for binary in allowlist:
+            self.assertNotIn("~", binary, f"path-like char in binary: {binary!r}")
+            self.assertNotIn("/Users/", binary, f"home path in binary: {binary!r}")
+            # A bare binary may itself be an absolute path (e.g. /bin/zsh), but it
+            # must never carry an argument that contains a slash + a filename that
+            # looks like a leaked path. We assert no later-element survived by
+            # checking the binary is a single token (no embedded spaces).
+            self.assertNotIn(" ", binary, f"binary carries an argument: {binary!r}")
+
+
+class CodexSafetyHappyPathTest(unittest.TestCase):
+    """R4 happy path — the real config keys surface as ENUM VALUES only;
+    per-project ``trust_level`` values appear but the ``[projects."<path>"]``
+    section keys (home-dir/project-name leaks) NEVER do; rules emit binaries
+    only."""
+
+    def test_enums_surfaced_and_project_paths_never_emitted(self):
+        config = (
+            'model = "gpt-5.5"\n'
+            'approvals_reviewer = "user"\n\n'
+            '[projects."/Users/x/proj"]\n'
+            'trust_level = "trusted"\n\n'
+            '[projects."/Users/x/another-secret-proj"]\n'
+            'trust_level = "untrusted"\n\n'
+            '[apps.connector_76869538009648d5b282a4bb21c3d157.tools.github_create_pull_request]\n'
+            'approval_mode = "approve"\n'
+        )
+        rules = (
+            'prefix_rule(pattern=["python3", "-m", "pipeline.workflow"], decision="allow")\n'
+            'prefix_rule(pattern=["git", "add"], decision="allow")\n'
+            'prefix_rule(pattern=["git", "commit", "-m"], decision="allow")\n'
+            'prefix_rule(pattern=["agent-browser"], decision="allow")\n'
+            'prefix_rule(pattern=["/bin/zsh", "-lc", "ls -la"], decision="allow")\n'
+        )
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _write_config(root, config)
+            _write_rules(root, {"default.rules": rules})
+            with patch.object(codex_extract, "CODEX_RULES_DIR", root / "rules"), \
+                 patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                safety = codex_extract.extract_safety_posture()
+
+        # Top-level reviewer enum surfaced verbatim.
+        self.assertEqual(safety["approvalsReviewer"], "user")
+        # Per-app approval_mode enum value(s) surfaced — VALUE only, never the key.
+        self.assertIn("approve", safety["approvalModes"])
+        # Per-project trust_level VALUES surfaced (deduped enum set).
+        self.assertEqual(sorted(safety["trustLevels"]), ["trusted", "untrusted"])
+
+        # Rules emit pattern[0] only, deduped (git add + git commit -> one "git").
+        allowlist = safety["rulesAllowlist"]
+        self.assertEqual(
+            sorted(allowlist),
+            ["/bin/zsh", "agent-browser", "git", "python3"],
+        )
+
+        # CRITICAL: the [projects."<path>"] section keys never appear anywhere.
+        blob = json.dumps(safety)
+        self.assertNotIn("/Users/x/proj", blob)
+        self.assertNotIn("another-secret-proj", blob)
+        self.assertNotIn("/Users/x", blob)
+        # CRITICAL: the [apps.connector_*] UUID section key never appears — only
+        # the approval_mode value beneath it was read.
+        self.assertNotIn("connector_", blob)
+        self.assertNotIn("76869538009648d5b282a4bb21c3d157", blob)
+        # And no later rule element / path / arg leaked.
+        self.assertNotIn("pipeline.workflow", blob)
+        self.assertNotIn("-lc", blob)
+        self.assertNotIn("ls -la", blob)
+
+    def test_trust_levels_are_deduped_enum_set_not_per_project_list(self):
+        # Many projects, all "trusted" → a single enum value, NOT one per project
+        # (a per-project list would leak the project count / shape).
+        config = (
+            'approvals_reviewer = "user"\n'
+            + "".join(
+                f'[projects."/Users/x/p{i}"]\ntrust_level = "trusted"\n'
+                for i in range(8)
+            )
+        )
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _write_config(root, config)
+            with patch.object(codex_extract, "CODEX_RULES_DIR", root / "rules"), \
+                 patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                safety = codex_extract.extract_safety_posture()
+        self.assertEqual(safety["trustLevels"], ["trusted"])
+        blob = json.dumps(safety)
+        for i in range(8):
+            self.assertNotIn(f"/Users/x/p{i}", blob)
+
+
+class CodexSafetyEdgeCaseTest(unittest.TestCase):
+    """R4 edge case — no ``rules/`` dir and an empty/minimal ``config.toml`` →
+    'none configured' / empty structures, no crash; no connector UUID, no
+    project-path keys."""
+
+    def test_no_rules_dir_and_minimal_config_is_clean(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            # Minimal config: no safety keys at all. rules/ deliberately absent.
+            _write_config(root, 'model = "gpt-5.5"\n')
+            with patch.object(codex_extract, "CODEX_RULES_DIR", root / "rules"), \
+                 patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                safety = codex_extract.extract_safety_posture()
+
+        self.assertEqual(safety["rulesAllowlist"], [])
+        self.assertIsNone(safety["approvalsReviewer"])
+        self.assertEqual(safety["approvalModes"], [])
+        self.assertEqual(safety["trustLevels"], [])
+
+    def test_absent_config_and_absent_rules_is_clean(self):
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            root.mkdir(parents=True)  # neither config.toml nor rules/ created
+            with patch.object(codex_extract, "CODEX_RULES_DIR", root / "rules"), \
+                 patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                safety = codex_extract.extract_safety_posture()
+        self.assertEqual(
+            safety,
+            {
+                "rulesAllowlist": [],
+                "approvalsReviewer": None,
+                "approvalModes": [],
+                "trustLevels": [],
+            },
+        )
+
+    def test_connector_uuid_section_key_never_emitted_even_with_apps_table(self):
+        # An [apps.connector_<uuid>] section present → read approval_mode VALUE
+        # only; the UUID section key must never appear.
+        config = (
+            '[apps.connector_deadbeefcafe1234.tools.gmail_send]\n'
+            'approval_mode = "ask"\n'
+        )
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _write_config(root, config)
+            with patch.object(codex_extract, "CODEX_RULES_DIR", root / "rules"), \
+                 patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                safety = codex_extract.extract_safety_posture()
+        self.assertEqual(safety["approvalModes"], ["ask"])
+        blob = json.dumps(safety)
+        self.assertNotIn("connector_", blob)
+        self.assertNotIn("deadbeefcafe1234", blob)
+        self.assertNotIn("gmail_send", blob)
+        self.assertNotIn("gmail", blob)
+
+    def test_malformed_rule_lines_are_skipped_not_crashed(self):
+        # Comment lines, blank lines, and non-prefix_rule lines must be ignored
+        # without raising.
+        rules = (
+            "# this is a comment\n"
+            "\n"
+            "deny_rule(pattern=[\"rm\"], decision=\"deny\")\n"  # not prefix_rule
+            "garbage that is not a rule at all\n"
+            'prefix_rule(pattern=["git", "status"], decision="allow")\n'
+            "prefix_rule(pattern=[])\n"  # empty pattern → nothing to emit
+        )
+        with TemporaryDirectory() as d:
+            root = Path(d) / ".codex"
+            _write_rules(root, {"default.rules": rules})
+            with patch.object(codex_extract, "CODEX_RULES_DIR", root / "rules"), \
+                 patch.object(codex_extract, "CODEX_CONFIG_PATH", root / "config.toml"):
+                safety = codex_extract.extract_safety_posture()
+        # Only the well-formed prefix_rule's binary survives.
+        self.assertEqual(safety["rulesAllowlist"], ["git"])
+        # The deny rule's binary must NOT be surfaced (we only parse prefix_rule).
+        self.assertNotIn("rm", safety["rulesAllowlist"])
+
+
 if __name__ == "__main__":
     unittest.main()
