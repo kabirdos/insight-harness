@@ -1,18 +1,27 @@
 # insight-harness
 
-A Claude Code skill that generates a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days.
+A shareable harness-profile skill for **Claude Code** and **OpenAI Codex CLI**.
+It generates a single-file HTML report of your local agent setup: skills, tools,
+workflow patterns, token/session stats, plugin inventory, safety posture, and
+other harness signals.
 
-It's a **superset of `/insights`** — everything `/insights` provides, plus token breakdowns, tool usage stats, skill inventory, hooks, agent patterns, and cost.
+For Claude Code, it is a **superset of `/insights`** — everything `/insights`
+provides, plus token breakdowns, tool usage stats, skill inventory, hooks, agent
+patterns, and cost. For Codex, it profiles the locally visible CLI data under
+`~/.codex/` and emits a Codex-shaped report that can be uploaded to
+[insightharness.com](https://insightharness.com).
 
 ## What it captures
 
 - **Tokens** — input/output/cache usage over the last 30 days
 - **Tools** — which built-in and MCP tools you invoke most
 - **Skills** — inventory of skills you have installed and which ones you actually use
-- **Hooks** — your configured hooks from `settings.json`
-- **Agents** — subagent usage patterns
-- **Cost** — dollar breakdown by model and by day
-- **Plugins** — installed plugin marketplaces and plugins
+- **Hooks** — Claude Code hook configuration from `settings.json`
+- **Agents** — Claude Code subagent usage patterns where available
+- **Cost** — Claude Code dollar breakdown by model and by day
+- **Plugins** — installed Claude plugins and Codex plugin configuration
+- **Codex CLI posture** — local Codex tools, CLI commands, skills, plugins,
+  safety/rules settings, workflow phase signal, and work surfaces
 
 ## How it runs (and what it doesn't do) 🧘
 
@@ -38,7 +47,9 @@ One Python script and an HTML template. No npm installs, no pip installs, no nat
 
 🛡️ **PII scrubbing before anything ships:** git name/email, OS username paths (`/Users/<you>`, `/home/<you>`), GitHub URLs with your username, and `@<you>` mentions are redacted. Hero images are text-scrubbed only — pixels are out of scope, so review screenshots before uploading. SVG heroes are rejected outright.
 
-## Install (plugin marketplace)
+## Install For Claude Code
+
+### Plugin marketplace
 
 Run these two commands inside Claude Code:
 
@@ -55,7 +66,7 @@ Then in any Claude Code session:
 
 …or just ask: _"run insight harness"_, _"show my harness"_, _"what skills do I use"_.
 
-## Install (curl fallback, for power users)
+### Curl fallback
 
 If you'd rather not use the plugin system, you can drop the skill directly into your skills directory:
 
@@ -65,6 +76,8 @@ curl -sSL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills
   -o ~/.claude/skills/insight-harness/SKILL.md
 curl -sSL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/extract.py \
   --create-dirs -o ~/.claude/skills/insight-harness/scripts/extract.py
+curl -sSL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/pii_scrub.py \
+  -o ~/.claude/skills/insight-harness/scripts/pii_scrub.py
 ```
 
 Or clone the whole repo and symlink:
@@ -74,9 +87,40 @@ git clone https://github.com/kabirdos/insight-harness.git
 ln -s "$(pwd)/insight-harness/skills/insight-harness" ~/.claude/skills/insight-harness
 ```
 
+## Install For Codex
+
+Codex does not use the Claude plugin marketplace. Install the same skill folder
+under `~/.codex/skills/insight-harness`:
+
+```bash
+mkdir -p ~/.codex/skills/insight-harness/scripts
+curl -sSL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/SKILL.md \
+  -o ~/.codex/skills/insight-harness/SKILL.md
+curl -sSL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/codex_extract.py \
+  -o ~/.codex/skills/insight-harness/scripts/codex_extract.py
+curl -sSL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/pii_scrub.py \
+  -o ~/.codex/skills/insight-harness/scripts/pii_scrub.py
+curl -sSL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/extract.py \
+  -o ~/.codex/skills/insight-harness/scripts/extract.py
+```
+
+Then run:
+
+```bash
+python3 ~/.codex/skills/insight-harness/scripts/codex_extract.py --include-skills
+```
+
+The Codex report is written under `~/.codex/usage-data/`. Upload the generated
+HTML file at [insightharness.com/upload](https://insightharness.com/upload).
+Direct `--publish` is currently Claude-only.
+
 ## Output
 
-The skill writes a single-file HTML report to `~/.claude/insight-harness/report.html` and opens it in your browser. Read it locally, or upload it to [insightharness.com](https://insightharness.com) to share as a public profile.
+The Claude Code path writes a single-file HTML report to
+`~/.claude/insight-harness/report.html` and opens it in your browser. The Codex
+path writes a single-file HTML report to `~/.codex/usage-data/`. Read reports
+locally, or upload them to [insightharness.com/upload](https://insightharness.com/upload)
+to share as a public profile.
 
 ## License
 

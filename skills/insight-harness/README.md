@@ -1,6 +1,6 @@
 # insight-harness
 
-> Generate a single-file HTML report of your Claude Code harness — skills, hooks, tool usage, token spend, and workflow patterns across the last 30 days.
+> Generate a single-file HTML report of your Claude Code or Codex harness — skills, tools, token/session stats, safety posture, and workflow patterns across recent local usage.
 
 ![insight-harness hero — dashboard with tool-call, token-usage, top-skill, and hooks-fired stat cards above a skills table and tool-usage bar chart](assets/hero.png)
 
@@ -10,7 +10,7 @@
 - You want to see your **token spend and tool-usage breakdown** without digging through raw JSONL session logs
 - You're tuning your harness and want to know **which hooks fire most** and how often
 - You want a **superset of `/insights`** — same stats plus skills, hooks, plugins, MCP servers, and workflow phase transitions
-- You want a shareable HTML file you can **upload to insightharness.com** to compare setups with other Claude Code users
+- You want a shareable HTML file you can **upload to insightharness.com** to compare setups with other Claude Code or Codex users
 
 ## What you say to Claude
 
@@ -28,6 +28,15 @@ Run an insight-harness report on my setup.
 
 Claude runs the extraction script against `~/.claude/` and opens the generated HTML in your browser. The report lands at `~/.claude/insight-harness/report.html`. The script uses a strict field whitelist — it never reads tool arguments, message text, tool results, or file paths from your session logs.
 
+For Codex, install this skill under `~/.codex/skills/insight-harness` and run:
+
+```bash
+python3 ~/.codex/skills/insight-harness/scripts/codex_extract.py --include-skills
+```
+
+The Codex report lands under `~/.codex/usage-data/` and can be uploaded at
+[insightharness.com/upload](https://insightharness.com/upload).
+
 ## What this does and doesn't do
 
 - **One-shot snapshot, not a daemon.** The script runs once, writes a single HTML file, and exits. It does **not** install hooks, background jobs, telemetry, or anything that keeps running after it finishes. Re-run it whenever you want a fresh snapshot; nothing changes in your harness between runs.
@@ -37,21 +46,39 @@ Claude runs the extraction script against `~/.claude/` and opens the generated H
 
 ## Install
 
+### Claude Code
+
 ```bash
-# From the claude-toolkit repo
-./install.sh --skills insight-harness             # into current project
-./install.sh --global --skills insight-harness    # into ~/.claude (all projects)
+# From this repo
+mkdir -p ~/.claude/skills
+cp -R skills/insight-harness ~/.claude/skills/insight-harness
 ```
 
 Or install and run in one line without cloning the repo:
 
 ```bash
 mkdir -p ~/.claude/skills/insight-harness/scripts && \
-curl -sL https://raw.githubusercontent.com/craigdossantos/claude-toolkit/main/skills/insight-harness/SKILL.md \
+curl -sL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/SKILL.md \
   -o ~/.claude/skills/insight-harness/SKILL.md && \
-curl -sL https://raw.githubusercontent.com/craigdossantos/claude-toolkit/main/skills/insight-harness/scripts/extract.py \
+curl -sL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/extract.py \
   -o ~/.claude/skills/insight-harness/scripts/extract.py && \
+curl -sL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/pii_scrub.py \
+  -o ~/.claude/skills/insight-harness/scripts/pii_scrub.py && \
 open "$(python3 ~/.claude/skills/insight-harness/scripts/extract.py)"
+```
+
+### Codex
+
+```bash
+mkdir -p ~/.codex/skills/insight-harness/scripts && \
+curl -sL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/SKILL.md \
+  -o ~/.codex/skills/insight-harness/SKILL.md && \
+curl -sL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/codex_extract.py \
+  -o ~/.codex/skills/insight-harness/scripts/codex_extract.py && \
+curl -sL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/pii_scrub.py \
+  -o ~/.codex/skills/insight-harness/scripts/pii_scrub.py && \
+curl -sL https://raw.githubusercontent.com/kabirdos/insight-harness/main/skills/insight-harness/scripts/extract.py \
+  -o ~/.codex/skills/insight-harness/scripts/extract.py
 ```
 
 After install, run `/insight-harness` or just mention "insight harness", "harness profile", "my setup", or "what skills do I use" — Claude will invoke the skill. New to skills? See the [main README](../../README.md#what-is-a-skill) for a one-minute primer.
@@ -77,6 +104,10 @@ If you don't want to drag-drop the report onto the upload page each time, the sk
 The token is saved to `~/.claude/insight-harness/config.json` with mode `0600` and reused on later runs, so subsequent invocations are just `/insight-harness --publish`. On a successful POST the skill prints `RESULT: <edit-url>` (which is also copied to your clipboard) — open it to review the draft and click "Make public" when you're ready to share. Tokens auto-expire 90 days after their last use; you can revoke at any time from the upload page.
 
 `--confirm` adds an interactive `[y/N]` prompt before uploading; in a non-TTY context it short-circuits to "save locally, don't POST."
+
+Codex direct publish is not wired yet. Upload the generated
+`~/.codex/usage-data/*-codex-harness.html` file manually at
+[insightharness.com/upload](https://insightharness.com/upload).
 
 ## See also
 
