@@ -4,7 +4,7 @@
     "name": "Craig Dos Santos",
     "url": "https://github.com/kabirdos"
   },
-  "description": "Marketplace for the insight-harness Claude Code skill.",
+  "description": "Marketplace for the insight-harness Claude Code and Codex harness skill.",
   "plugins": [
     {
       "name": "insight-harness",
@@ -12,7 +12,7 @@
         "source": "url",
         "url": "https://github.com/kabirdos/insight-harness.git"
       },
-      "description": "Generate a comprehensive profile of your Claude Code harness — skills, hooks, workflow patterns, tool usage, token consumption, and plugin inventory across the last 30 days."
+      "description": "Generate a comprehensive profile of your Claude Code or Codex harness — skills, tools, workflow patterns, token/session stats, safety posture, and plugin inventory."
     }
   ]
 }
