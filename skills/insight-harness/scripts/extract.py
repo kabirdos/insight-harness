@@ -15,8 +15,10 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -69,7 +71,7 @@ HOOKS_DIR = CLAUDE_DIR / "hooks"
 AGENTS_DIR = CLAUDE_DIR / "agents"
 
 DAYS = 30
-VERSION = "2.9.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
+VERSION = "2.10.0"  # Keep in sync with SKILL.md frontmatter and plugin.json
 ENV_ASSIGN = re.compile(r'^([A-Z_][A-Z0-9_]*)=')
 
 
@@ -147,9 +149,141 @@ _NODE_TEST_SUBCOMMANDS = {
 
 # ── Static Config ──────────────────────────────────────────────────────────
 
+# Known secret-bearing shapes that must never ship inside a published hook
+# command. Kept local (not imported from codex_extract) to avoid an import cycle
+# — codex_extract imports from this module. Covers API-key prefixes (OpenAI/
+# Anthropic `sk-`, `Bearer` — HTTP schemes are case-insensitive so "bearer"
+# matches, classic + fine-grained GitHub PATs, AWS `AKIA`, Slack `xox*`),
+# notification webhook URLs (Slack/Discord) that embed a token in the path, and
+# the generic `scheme://user:pass@host` credentials-in-URL form — the most
+# likely inline secret in a notification hook. IGNORECASE + over-redaction
+# (brainstorm R13: false positives are acceptable). The serialized-output secret
+# gate remains the final backstop for anything this list misses.
+_HOOK_SECRET_RE = re.compile(
+    r"Bearer\s+[A-Za-z0-9_\-][A-Za-z0-9_\-.=/+]{4,}"
+    r"|(?<![A-Za-z0-9])sk-[A-Za-z0-9_\-]{8,}"  # token start only: not ta`sk-`, ma`sk-`
+    r"|gh[pousr]_[A-Za-z0-9]{8,}"
+    r"|github_pat_[A-Za-z0-9_]{8,}"
+    r"|AKIA[A-Za-z0-9]{8,}"
+    r"|ih_[0-9a-f]{40,}"  # our own publish token (ih_<12hex><64hex>)
+    r"|glpat-[A-Za-z0-9_\-]{8,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{8,}"
+    r"|https?://hooks\.slack\.com/services/\S+"
+    r"|https?://(?:[a-z0-9-]+\.)*discord(?:app)?\.com/api/webhooks/\S+"
+    r"|[a-z][a-z0-9+.\-]*://[^/\s:@]+:[^/\s@]+@",  # creds in URL, any scheme
+    re.IGNORECASE,
+)
+HOOK_COMMAND_REDACTED = "<redacted: possible secret>"
+
+# Any token containing a slash is a path and is replaced wholesale with the
+# placeholder `<path>`. We deliberately do NOT keep the basename: for a
+# directory-valued path (`cd ~/Coding/<client>`) the basename IS the private
+# project/client name, and for a script path the basename is already carried
+# safely in the separate `script` field — so the basename is either unsafe or
+# redundant. URLs (`://`) likewise collapse to `<url>` (host/query/fragment can
+# all carry secrets or internal names). A leading `flag=`/`key=` prefix is kept
+# so only the value collapses. This is a single uniform rule across absolute,
+# relative, `~/`, `$VAR/`, URL, and SSH forms.
+def _abstract_unquoted(token):
+    prefix, sep, rest = token.partition("=")
+    if sep and ("://" in rest or "/" in rest):
+        return prefix + sep + _abstract_unquoted(rest)
+    if "://" in token:
+        return "<url>"
+    if "/" not in token:
+        return token
+    return "<path>"
+
+
+def _abstract_token(token):
+    # A quoted span may be a whole shell snippet (`bash -lc "cd /x && npm test"`),
+    # not just a path — recurse through full tokenization so the actions survive
+    # and only the path/URL tokens inside collapse. Peeling the quote also keeps
+    # a spaced private segment from leaking by being split across outer tokens.
+    if len(token) >= 2 and token[0] in "'\"" and token[-1] == token[0]:
+        return token[0] + _abstract_paths(token[1:-1]) + token[0]
+    return _abstract_unquoted(token)
+
+
+_ESCAPED_SPACE_SENTINEL = "\x00"
+
+
+def _abstract_paths(text):
+    # shlex tokenization (posix=False keeps quotes) so paths containing quoted
+    # spaces stay one token. Backslash-escaped spaces (`acme\ client`) would
+    # still split, so stage them to a sentinel first and restore after — keeping
+    # the whole path one token so its private segments can't leak. On unbalanced
+    # quotes / unparseable input, fall back to whitespace splitting (best-effort;
+    # the secret gate has already run).
+    staged = text.replace("\\ ", _ESCAPED_SPACE_SENTINEL)
+    try:
+        tokens = shlex.split(staged, posix=False)
+    except ValueError:
+        tokens = staged.split()
+    return " ".join(
+        _abstract_token(t).replace(_ESCAPED_SPACE_SENTINEL, "\\ ") for t in tokens
+    )
+
+
+# Generic entropy backstop. The prefix list above is a fast-path for known token
+# families; this catches the long tail (GitLab glpat already added, plus Stripe,
+# Google, npm, and future shapes) without enumerating every vendor. A contiguous
+# alphanumeric run of >= 20 chars with Shannon entropy >= 4.0 bits/char is almost
+# always an opaque credential — file paths, flags, and dotted/underscored
+# identifiers break into short low-entropy runs and stay well under the bar.
+_HOOK_ENTROPY_MIN_RUN = 20
+_HOOK_ENTROPY_THRESHOLD = 4.0
+_HOOK_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9]{%d,}" % _HOOK_ENTROPY_MIN_RUN)
+
+
+def _max_token_entropy(text):
+    """Highest Shannon entropy (bits/char) among long opaque alphanumeric runs.
+
+    Returns 0.0 when there is no run of at least ``_HOOK_ENTROPY_MIN_RUN`` chars.
+    """
+    best = 0.0
+    for run in _HOOK_TOKEN_RUN_RE.findall(text):
+        counts = Counter(run)
+        n = len(run)
+        entropy = -sum((c / n) * math.log2(c / n) for c in counts.values())
+        if entropy > best:
+            best = entropy
+    return best
+
+
+def scrub_hook_command(cmd, rules):
+    """Return a hook command safe to publish, or a redaction marker.
+
+    Hook commands are exposed (scrubbed) so a consuming agent can actually copy
+    a hook config, not just see a script filename (Phase 0 F5 / brainstorm R13).
+    Order: (1) redact the ENTIRE command if a known secret-token shape or a
+    high-entropy token is present (over-redaction is acceptable); (2) abstract
+    every path-bearing token to its basename so private project/client/host
+    segments don't leak; (3) apply the standard identity/owner PII scrub. Empty
+    command -> "".
+    """
+    if not cmd:
+        return ""
+    if _HOOK_SECRET_RE.search(cmd) or _max_token_entropy(cmd) >= _HOOK_ENTROPY_THRESHOLD:
+        return HOOK_COMMAND_REDACTED
+    # Abstract paths on the RAW command so the username segment is dropped along
+    # with the project/client/host segments in one pass.
+    abstracted = _abstract_paths(cmd)
+    try:
+        scrubbed = scrub(abstracted, rules=rules, context="hook-command")
+    except SanitizeError:
+        return HOOK_COMMAND_REDACTED
+    if _HOOK_SECRET_RE.search(scrubbed):
+        return HOOK_COMMAND_REDACTED
+    return scrubbed
+
+
 def extract_settings():
     settings = safe_json_load(CLAUDE_DIR / "settings.json") or {}
-    hooks = []
+    # First pass: collect raw hook entries. We need every command up front so the
+    # PII owner-scan can be seeded with their text (below) — a github.com/<owner>
+    # URL in a command must be rewritten too, not just identity/paths.
+    raw_hooks = []  # (event, matcher, raw_command, script_name)
     for event, matchers in settings.get("hooks", {}).items():
         for mb in matchers:
             matcher = mb.get("matcher", "(all)")
@@ -170,7 +304,23 @@ def extract_settings():
                         first = cmd.strip().split()[0] if cmd.strip() else ""
                         if first and first not in ('#', 'if', 'then', 'fi', '{', '}', 'else'):
                             script_name = Path(first).name or "inline-bash"
-                hooks.append({"event": event, "matcher": matcher or "(all)", "script": script_name})
+                raw_hooks.append((event, matcher or "(all)", cmd, script_name))
+
+    # Build the scrub ruleset with the hook commands as owner-scan content, so
+    # the existing GitHub-owner URL rewrite applies to commands too (not just
+    # identity/paths). scrub_hook_command adds the secret-token backstop on top.
+    scrub_rules = detect_pii(
+        content_for_owner_scan="\n".join(cmd for _, _, cmd, _ in raw_hooks)
+    )
+    hooks = [
+        {
+            "event": event,
+            "matcher": matcher,
+            "script": script_name,
+            "command": scrub_hook_command(cmd, scrub_rules),
+        }
+        for event, matcher, cmd, script_name in raw_hooks
+    ]
     enabled_plugins = {}
     for pid, enabled in settings.get("enabledPlugins", {}).items():
         name = pid.split("@")[0]
@@ -2493,7 +2643,14 @@ def generate_html(data):
 
     # Hook definitions array
     _hook_defs_json = [
-        {"event": h.get("event", ""), "matcher": h.get("matcher", ""), "script": h.get("script", "")}
+        {
+            "event": h.get("event", ""),
+            "matcher": h.get("matcher", ""),
+            "script": h.get("script", ""),
+            # Scrubbed at extraction time (scrub_hook_command); already safe to
+            # serialize. Lets a consuming agent copy the hook, not just its name.
+            "command": h.get("command", ""),
+        }
         for h in hook_defs
     ]
 

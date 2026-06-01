@@ -1,5 +1,5 @@
 ---
-version: 2.9.0
+version: 2.10.0
 name: insight-harness
 description: Generate a comprehensive profile of your Claude Code or Codex harness — skills, tools, workflow patterns, token/session stats, safety posture, and plugin inventory. Claude Code runs against ~/.claude; Codex runs against ~/.codex. Upload to insightharness.com to share. Also has a LEARN mode — given a published profile URL it fetches that person's setup and tells you what to copy. Triggers on "insight harness", "harness profile", "my setup", "what skills do I use", "show my harness", "codex harness", "harness report", "learn from this harness", "what can I learn from <insightharness.com/insights URL>", or a pasted insightharness.com/insights profile link.
 user-invocable: true
@@ -37,6 +37,16 @@ Runs a Python extraction script that reads harness metadata from:
 - Existence + last-modified time (NOT contents) of a small list of other agent-tool data directories — `~/.codex`, `~/.cursor`, `~/.gemini`, `~/.copilot`, `~/.factory`, `~/Library/Application Support/Codex`, `~/Library/Application Support/Claude/claude-code` — to populate the "Work Surfaces" section.
 
 **Privacy guarantee:** The script uses a strict field whitelist. It NEVER reads tool arguments, message text, tool results, file paths inside your projects, or any project-specific content. The one envelope field it reads beyond names/events is `entrypoint`, a non-PII enum (`cli`, `sdk-cli`, etc.) used for the Work Surfaces breakdown. Other agent tools are detected by directory presence and mtime only — their contents are never opened or read. Real credentials exist in JSONL files — the script never touches those fields.
+
+**Hook commands** from your global `settings.json` are now included (so a viewer can copy a useful hook), but they are aggressively sanitized first:
+
+- Every **slash-bearing file path** collapses to `<path>` and every **URL** to `<url>` (the script basename is still available in the `script` field; project/client/host names inside paths or URLs never ship).
+- Git identity is scrubbed.
+- If a known secret-token shape (`sk-…`, `Bearer …`, `gh[pousr]_…`, `github_pat_…`, `glpat-…`, `AKIA…`, our own `ih_…` token, Slack `xox*`/webhooks, Discord webhooks, `scheme://user:pass@` URLs) **or any sufficiently high-entropy token** is present, the **entire** command is replaced with `<redacted: possible secret>`.
+
+The result preserves the copyable structure (interpreter, flags, simple inline logic) while dropping anything machine-specific or sensitive. Because `/` is ambiguous between a file path and an inline expression (a `jq`/`sed`/regex snippet), **safety is prioritized over fidelity**: any slash-bearing token is collapsed to `<path>`, so a complex slash-heavy one-liner may render lossy. The `script` field still carries the hook's script name. The script reads hook command strings only — never the contents of any external script file they invoke.
+
+One residual: a **bare** argument that happens to be a private name (e.g. `cd my-client-dir`) cannot be told apart from any other word and may appear. This is the same combinatorial-fingerprinting exposure as the rest of a published profile (your skill, plugin, and MCP names), which the publish flow discloses — it is not a credential leak (secrets and slash-paths are handled above).
 
 **Skill showcase data (default-on):** By default, the script also reads each shareable skill's `README.md` and hero image, scrubs PII from the README text (git name/email, OS username paths, GitHub URLs with your username, `@<you>` mentions), and ships the results. Skills with `repo: private` or `repo: none` in their SKILL.md frontmatter are excluded entirely — they never appear in the output, not even in invocation counts. See the "Skipping showcase content" section if you want to opt out of shipping README + hero data.
 
