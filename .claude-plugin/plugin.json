@@ -1,6 +1,6 @@
 {
   "name": "insight-harness",
-  "version": "2.8.0",
+  "version": "2.9.0",
   "description": "Generate a comprehensive profile of your Claude Code or Codex harness — skills, tools, workflow patterns, token/session stats, safety posture, and plugin inventory.",
   "author": {
     "name": "Craig Dos Santos"
