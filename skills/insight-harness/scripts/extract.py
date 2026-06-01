@@ -1777,6 +1777,75 @@ def compute_throughput_total_tokens(jsonl, meta):
 
 # ── HTML Generation ────────────────────────────────────────────────────────
 
+# Plain-language timing for each Claude Code hook lifecycle event. Describes
+# only WHEN a hook fires — a structural fact read straight from the config —
+# never what the script does, which we cannot know without reading its body.
+# A previous version hardcoded the insight-harness author's own five script
+# descriptions and stamped them onto every report regardless of reality
+# (Phase 0 finding F6). Honest data is the load-bearing product property, so
+# the narrative now derives everything from the user's actual config.
+_HOOK_EVENT_TIMING = {
+    "PreToolUse": "before a tool runs",
+    "PostToolUse": "after a tool runs",
+    "UserPromptSubmit": "when you submit a prompt",
+    "Stop": "when a turn finishes",
+    "SubagentStop": "when a sub-agent finishes",
+    "SessionStart": "at session start",
+    "SessionEnd": "at session end",
+    "PreCompact": "before context compaction",
+    "Notification": "on notifications",
+}
+
+
+def _activity_sentence(total_sessions, avg_duration_minutes, autonomy_ratio):
+    """Build the overview activity sentence from only the stats we actually have.
+
+    Zero or missing stats are omitted rather than asserted: a report once read
+    "averaging about 0 minutes each" for a user whose duration data was empty
+    (Phase 0 finding F7). Returns "" when there is nothing truthful to say.
+    """
+    if not total_sessions:
+        return ""
+    sentence = f"Over the last 30 days, they've run {total_sessions} sessions"
+    if avg_duration_minutes and round(avg_duration_minutes) >= 1:
+        sentence += f" averaging about {avg_duration_minutes:.0f} minutes each"
+    if autonomy_ratio and autonomy_ratio > 0:
+        sentence += f", with roughly 1 human message for every {round(1 / autonomy_ratio)} Claude messages"
+    return sentence + "."
+
+
+def _describe_hooks(hook_defs, he):
+    """Return <li> rows describing each hook by event + matcher only.
+
+    These are facts read straight from settings (when the hook fires, what it
+    matches) — never an assumption about what the script body does. Skips
+    inline/unknown scripts and de-dupes on (event, matcher, script). `he` is the
+    caller's HTML-escaping helper.
+    """
+    seen = set()
+    rows = []
+    for h in hook_defs:
+        script = h.get("script", "")
+        if script in ("inline-bash", "unknown", ""):
+            continue
+        event = h.get("event", "")
+        matcher = h.get("matcher", "")
+        key = (event, matcher, script)
+        if key in seen:
+            continue
+        seen.add(key)
+        timing = _HOOK_EVENT_TIMING.get(event, "")
+        scope = "" if matcher in ("", "(all)") else f" on <code>{he(matcher)}</code>"
+        if timing:
+            detail = f" — fires {timing}{scope}"
+        elif scope:
+            detail = f" — fires{scope}"
+        else:
+            detail = ""
+        rows.append(f"<li><strong>{he(script)}</strong>{detail}</li>")
+    return rows
+
+
 def generate_writeup(data):
     """Generate a narrative writeup explaining the harness setup for other developers."""
     meta = data["session_meta_summary"]
@@ -1832,11 +1901,10 @@ def generate_writeup(data):
         style_desc = "a collaborative style, actively guiding Claude through tasks with frequent interaction"
         style_tip = "This gives maximum control. If sessions feel slow, try writing more detailed upfront prompts and using skills that structure multi-step work."
 
+    activity = _activity_sentence(total_sessions, meta.get("avg_duration_minutes", 0), ar)
     sections.append(f'''<div class="writeup-section">
         <h2>How This Harness Works</h2>
-        <p>This developer uses Claude Code with <strong>{style_desc}</strong>. Over the last 30 days, they've run {total_sessions} sessions
-        averaging about {meta.get("avg_duration_minutes", 0):.0f} minutes each, with roughly 1 human message for every
-        {round(1/ar) if ar > 0 else "?"} Claude messages.</p>
+        <p>This developer uses Claude Code with <strong>{style_desc}</strong>.{(" " + activity) if activity else ""}</p>
         <p class="tip">{style_tip}</p>
     </div>''')
 
@@ -1880,29 +1948,18 @@ def generate_writeup(data):
     hook_lines = []
     if hook_defs:
         hook_events_list = list({h["event"] for h in hook_defs})
-        hook_scripts_list = list({h["script"] for h in hook_defs if h["script"] not in ("inline-bash", "unknown")})
+        hook_fire_count = sum(jsonl.get("hook_events", {}).values())
 
-        hook_lines.append(f"<p>This harness has <strong>{len(hook_defs)} hooks</strong> configured across {len(hook_events_list)} lifecycle events ({', '.join(he(e) for e in sorted(hook_events_list))}). These hooks fired <strong>{sum(jsonl.get('hook_events', {}).values()):,}</strong> times in the last 30 days — that's roughly {sum(jsonl.get('hook_events', {}).values()) // max(total_sessions, 1)} times per session.</p>")
+        intro = f"This harness has <strong>{len(hook_defs)} hooks</strong> configured across {len(hook_events_list)} lifecycle events ({', '.join(he(e) for e in sorted(hook_events_list))})."
+        if hook_fire_count:
+            intro += f" These hooks fired <strong>{hook_fire_count:,}</strong> times in the last 30 days — that's roughly {hook_fire_count // max(total_sessions, 1)} times per session."
+        hook_lines.append(f"<p>{intro}</p>")
 
-        # Describe what the hooks do
-        script_descs = {
-            "dcg": "blocks destructive shell commands (rm -rf, git push --force, etc.) before they execute",
-            "validate_file_write.py": "prevents writes to sensitive files (.env, credentials) and paths outside the project",
-            "format_and_lint.py": "automatically runs Prettier and ESLint on every file Claude writes or edits",
-            "auto_approve.py": "auto-approves low-risk tool calls (web fetch, MCP tools, task management) to reduce permission fatigue",
-            "save_session.py": "ensures session state is saved at the end of every conversation for cross-session continuity",
-        }
-        described = []
-        for s in hook_scripts_list:
-            desc = script_descs.get(s, "")
-            if desc:
-                described.append(f"<li><strong>{he(s)}</strong> — {desc}</li>")
-            else:
-                described.append(f"<li><strong>{he(s)}</strong></li>")
-        if described:
-            hook_lines.append("<p>The hook scripts and what they do:</p><ul>" + "".join(described) + "</ul>")
-
-        hook_lines.append('<p class="tip">This is a mature safety setup. The combination of destructive command guarding + file write validation + auto-formatting means Claude can work fast with guardrails. If you\'re setting up your own harness, these four hooks cover the most important safety/quality bases.</p>')
+        # Describe each hook by when it fires and what it matches — facts from
+        # the actual config, not assumptions about what the script does.
+        hook_rows = _describe_hooks(hook_defs, he)
+        if hook_rows:
+            hook_lines.append("<p>The configured hooks and when they fire:</p><ul>" + "".join(hook_rows) + "</ul>")
     else:
         hook_lines.append("<p>No hooks are configured. Hooks are one of the highest-leverage harness features — they let you add safety guardrails, auto-formatting, and auto-approval without changing how you interact with Claude. Start with a PreToolUse hook on Bash to block destructive commands.</p>")
 
