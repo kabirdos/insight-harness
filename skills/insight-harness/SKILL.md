@@ -194,17 +194,56 @@ open "<absolute-path-from-the-final-stdout-line>"
 
 Pass `--no-include-skills` to skip per-skill READMEs and heroes for a smaller report.
 
-### Codex publishing
+### Codex publishing (`--publish`)
 
-Direct `--publish` is currently Claude-only. For Codex, upload the generated
-`~/.codex/usage-data/*-codex-harness.html` file manually at
-https://insightharness.com/upload. The live site supports Codex-only reports and
-combined multi-tool profiles through the embedded `harness-data` payload.
+Codex supports the same direct `--publish` flow as the Claude extractor. It is
+opt-in — running without `--publish` keeps everything local.
+
+The token is **strictly Codex-local**: stored at and read from
+`~/.codex/insight-harness/config.json` (mode 0600), and the Codex extractor never
+falls back to the Claude skill's token. The bearer token decides which account a
+report publishes under, so a cross-namespace fallback could publish under the wrong
+account. A user who already authed via the Claude skill pastes the token once for
+Codex.
+
+To get a token, the user visits https://insightharness.com/upload, signs in, and
+copies the displayed `ih_...` token. Then either:
+
+```bash
+# One-shot — save the token AND publish this run. SAME background-Bash pattern as
+# the default invocation (extraction runs under --publish too, so it can hit the
+# 10-minute foreground ceiling on heavy setups).
+python3 ~/.codex/skills/insight-harness/scripts/codex_extract.py --publish --token=ih_... > /tmp/codex-extract.log 2>&1
+
+# Token-only (no extraction, fast). Persists to ~/.codex/insight-harness/config.json
+# (mode 0600) and exits. Works even before ~/.codex has any sessions.
+python3 ~/.codex/skills/insight-harness/scripts/codex_extract.py --token=ih_...
+
+# Subsequent runs read the saved token from config — no --token needed.
+python3 ~/.codex/skills/insight-harness/scripts/codex_extract.py --publish > /tmp/codex-extract.log 2>&1
+```
+
+**Invocation pattern under `--publish`:** the first and third commands run the full
+extractor and must be **background Bash tasks** (`run_in_background: true`), exactly
+like the default invocation. The token-only second command is fast and may run in the
+foreground.
+
+Branch on the **final stdout line**, not the exit code (see "Output contract"
+above): `RESULT: <edit-url>` (published; URL also copied to the clipboard) or
+`LOCAL: <path>` (saved locally — publish failed, or `--confirm` short-circuited in a
+non-TTY). A bare path means `--publish` was not passed.
+
+Manual upload of the generated `~/.codex/usage-data/*-codex-harness.html` at
+https://insightharness.com/upload still works if you'd rather not use a token. The
+live site supports Codex-only reports and combined multi-tool profiles through the
+embedded `harness-data` payload.
 
 ### Exit codes
 
-- **0** — success; the report path is the final stdout line.
-- **2** — the **secret gate** caught a known token prefix (`sk-`, `Bearer ...`, `AKIA`, `ghp_`) in the serialized output and refused to write the file. The stderr explains where; nothing was written to disk. This is the load-bearing privacy backstop — investigate before retrying.
+- **0** — success. Final stdout line is the report path (no `--publish`),
+  `RESULT: <url>` (published), or `LOCAL: <path>` (saved locally — e.g. a non-TTY
+  `--confirm` skip). Branch on the line prefix, not the code.
+- **2** — either the **secret gate** caught a known token prefix (`sk-`, `Bearer ...`, `AKIA`, `ghp_`) in the serialized output and refused to write the file (nothing written to disk — the load-bearing privacy backstop; investigate before retrying), **or** a `--publish` upload failed (401/429/5xx/network), in which case the report is saved locally and the final line is `LOCAL: <path>`.
 
 ### Local Codex limit (state it on the artifact)
 

@@ -52,6 +52,12 @@ from extract import (  # noqa: F401
     _read_hero_image,
     _read_raw_readme,
     _truncate_to_bytes,
+    # Direct-publish helpers (reused verbatim; each accepts injected paths so
+    # the Codex extractor supplies its own config/report locations — see
+    # CODEX_PUBLISH_CONFIG_PATH / CODEX_PUBLISH_REPORT_PATH below).
+    save_token_to_config,
+    load_token_from_config,
+    publish_report,
 )
 
 # --- Codex roots (single-rooted + shallow, mirroring extract.py's CLAUDE_DIR) -
@@ -69,7 +75,15 @@ CODEX_VERSION_PATH = CODEX_DIR / "version.json"
 # Claude's ~/.claude/usage-data/.
 CODEX_USAGE_DATA_DIR = CODEX_DIR / "usage-data"
 
-VERSION = "0.1.0"  # Phase 1 scaffold — bump as units land.
+# Direct-publish paths — strictly Codex-namespaced. The token config is NEVER
+# read from the Claude path (~/.claude/insight-harness/config.json): the server
+# publishes under whichever account the bearer token owns, so a cross-namespace
+# fallback could publish a Codex report under the wrong account. Self-contained
+# by design. report.html is the stable local-save target on publish failure.
+CODEX_PUBLISH_CONFIG_PATH = CODEX_DIR / "insight-harness" / "config.json"
+CODEX_PUBLISH_REPORT_PATH = CODEX_USAGE_DATA_DIR / "report.html"
+
+VERSION = "0.2.0"  # Direct-publish (--publish/--token/--confirm) landed.
 
 
 # --- Rollout parsing (Unit 2) ------------------------------------------------
@@ -712,30 +726,52 @@ def extract_safety_posture() -> dict:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Argparse skeleton for the Codex extractor.
+    """Argparse parser for the Codex extractor.
 
     Mirrors extract.py's `--include-skills` / `--no-include-skills` pair
-    (default: include). Later units add token / safety / publish flags.
+    (default: include) plus the `--publish` / `--token` / `--confirm`
+    direct-publish flags. The publish flags reuse extract.py's helpers
+    against a Codex-local token config (see CODEX_PUBLISH_CONFIG_PATH).
     """
     parser = argparse.ArgumentParser(
         prog="codex_extract",
         description=(
             "Extract a standalone OpenAI Codex CLI harness profile from "
-            "~/.codex/ (Phase 1: local generation only, no publish)."
+            "~/.codex/ and optionally publish it to insightharness.com."
+        ),
+        epilog=(
+            "Without --publish, the final stdout line is the absolute path to "
+            "the dated HTML report. With --publish, the final stdout line is "
+            "RESULT: <edit-url> (success) or LOCAL: <path> (saved locally)."
         ),
     )
-    parser.add_argument(
+    showcase = parser.add_mutually_exclusive_group()
+    showcase.add_argument(
         "--include-skills",
         dest="include_skills",
         action="store_true",
         default=True,
         help="Include per-skill showcase content (README + hero). Default: on.",
     )
-    parser.add_argument(
+    showcase.add_argument(
         "--no-include-skills",
         dest="include_skills",
         action="store_false",
         help="Opt out of per-skill showcase content for a smaller profile.",
+    )
+    # Direct-publish flags (mirror extract.py; Codex-local token config).
+    parser.add_argument(
+        "--publish", action="store_true",
+        help="POST the generated HTML to insightharness.com after extraction.",
+    )
+    parser.add_argument(
+        "--token", default=None, metavar="TOKEN",
+        help="Save this ih_... token to ~/.codex/insight-harness/config.json. "
+             "Use with --publish to also publish on this run.",
+    )
+    parser.add_argument(
+        "--confirm", action="store_true",
+        help="Prompt [y/N] before uploading under --publish. Non-TTY = skip upload.",
     )
     return parser
 
@@ -1668,14 +1704,55 @@ def generate_profile(include_skills: bool = True) -> tuple[str, dict, dict]:
 
 
 def main(argv=None) -> int:
-    """Output contract: write the HTML profile under ``~/.codex/usage-data/``
-    and print its absolute path as the FINAL stdout line.
+    """Output contract: the FINAL stdout line is machine-readable.
 
-    Returns an exit code (0 on success / clean no-data exit). The
-    ``__main__`` guard calls ``sys.exit(main())``.
+    Without ``--publish`` it is the absolute path to the dated HTML profile
+    under ``~/.codex/usage-data/``. With ``--publish`` it is ``RESULT: <url>``
+    on success or ``LOCAL: <path>`` when the report was saved locally instead
+    of uploaded — so consumers parse the line prefix, never the exit code
+    (a non-TTY ``--confirm`` skip returns 0 with a ``LOCAL:`` line).
+
+    Returns an exit code. The ``__main__`` guard calls ``sys.exit(main())``.
     """
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    # --- Token + publish-token resolution (runs BEFORE the no-~/.codex early
+    # return). Token persistence does not need ~/.codex to exist, so `--token`
+    # alone must work on a fresh Codex machine. Strictly self-contained: only
+    # ever the Codex config path, never ~/.claude (the bearer token decides
+    # which account a report publishes under — a cross-namespace fallback could
+    # publish under the wrong account).
+    if args.token is not None and not args.publish:
+        try:
+            save_token_to_config(args.token, config_path=CODEX_PUBLISH_CONFIG_PATH)
+        except ValueError as e:
+            print("Invalid token: " + str(e), file=sys.stderr)
+            return 2
+        print(
+            "Saved token to " + str(CODEX_PUBLISH_CONFIG_PATH) + " (mode 0600).",
+            file=sys.stderr,
+        )
+        return 0
+
+    publish_token = None
+    if args.publish:
+        if args.token is not None:
+            try:
+                save_token_to_config(args.token, config_path=CODEX_PUBLISH_CONFIG_PATH)
+            except ValueError as e:
+                print("Invalid token: " + str(e), file=sys.stderr)
+                return 2
+            publish_token = args.token
+        else:
+            publish_token = load_token_from_config(config_path=CODEX_PUBLISH_CONFIG_PATH)
+            if publish_token is None:
+                print(
+                    "No token configured. Visit https://insightharness.com/upload "
+                    "to get one.",
+                    file=sys.stderr,
+                )
+                return 2
 
     # Edge case: absent ~/.codex → clean "no Codex data" exit, no crash.
     # Read CODEX_DIR at call time (not a precomputed constant) so a test that
@@ -1712,8 +1789,20 @@ def main(argv=None) -> int:
     report_path = (CODEX_USAGE_DATA_DIR / f"{date_str}-codex-harness.html").resolve()
     report_path.write_text(html, encoding="utf-8")
 
-    # Final stdout line = the canonical report path (the output contract the
-    # skill instructions read).
+    if args.publish:
+        # Read back the bytes we just wrote so the upload ships exactly what is
+        # on disk. publish_report prints the RESULT:/LOCAL: final line itself
+        # and, on failure, saves a stable copy at CODEX_PUBLISH_REPORT_PATH.
+        html_bytes = report_path.read_bytes()
+        return publish_report(
+            html_bytes,
+            publish_token,
+            confirm=args.confirm,
+            report_path=CODEX_PUBLISH_REPORT_PATH,
+        )
+
+    # Default contract (no --publish): final stdout line = the canonical report
+    # path (the output contract the skill instructions read).
     print(str(report_path))
     return 0
 

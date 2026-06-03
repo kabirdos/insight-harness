@@ -105,8 +105,11 @@ The token is saved to `~/.claude/insight-harness/config.json` with mode `0600` a
 
 `--confirm` adds an interactive `[y/N]` prompt before uploading; in a non-TTY context it short-circuits to "save locally, don't POST."
 
-Codex direct publish is not wired yet. Upload the generated
-`~/.codex/usage-data/*-codex-harness.html` file manually at
+Codex supports the same direct publish flow: `codex_extract.py --publish
+--token=ih_...`. The token is stored **Codex-locally** at
+`~/.codex/insight-harness/config.json` (mode `0600`) and never falls back to the
+Claude token path, so a report always publishes under the account you intend. Or
+upload the generated `~/.codex/usage-data/*-codex-harness.html` file manually at
 [insightharness.com/upload](https://insightharness.com/upload).
 
 ## See also

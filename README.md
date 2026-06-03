@@ -110,9 +110,11 @@ Then run:
 python3 ~/.codex/skills/insight-harness/scripts/codex_extract.py --include-skills
 ```
 
-The Codex report is written under `~/.codex/usage-data/`. Upload the generated
-HTML file at [insightharness.com/upload](https://insightharness.com/upload).
-Direct `--publish` is currently Claude-only.
+The Codex report is written under `~/.codex/usage-data/`. Codex supports the same
+direct `--publish` flow as Claude — add `--publish --token=ih_...` (the token is
+stored Codex-locally at `~/.codex/insight-harness/config.json` and reused on later
+runs). Or upload the generated HTML file manually at
+[insightharness.com/upload](https://insightharness.com/upload).
 
 ## Output
 
