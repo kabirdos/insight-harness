@@ -1544,6 +1544,40 @@ def extract_experimental_features():
     return {"experimental_flags": experimental, "other_env_flags": other_env}
 
 
+def _build_daily_activity(daily, daily_model_tokens, keep=35):
+    """Join per-day sessions (dailyActivity) with summed per-day tokens
+    (dailyModelTokens) into ``[{date, sessions, tokens}]``, most recent ``keep``
+    days.
+
+    Lets the report render the user's ACTUAL daily series in the activity
+    heatmap instead of a seeded synthetic approximation. Each entry is a small
+    non-PII aggregate (a date and two counts)."""
+    tokens_by_date = {}
+    for entry in daily_model_tokens or []:
+        date = entry.get("date", "")
+        if not date:
+            continue
+        tbm = entry.get("tokensByModel", {})
+        tokens_by_date[date] = sum(
+            v for v in tbm.values() if isinstance(v, (int, float))
+        )
+    out = []
+    for d in daily or []:
+        date = d.get("date", "")
+        if not date:
+            continue
+        out.append(
+            {
+                "date": date,
+                "sessions": d.get("sessionCount", 0),
+                "tokens": tokens_by_date.get(date, 0),
+            }
+        )
+    # Sort by ISO date (lexical == chronological) before trimming so "most
+    # recent keep days" holds even if stats-cache ever emits unordered rows.
+    return sorted(out, key=lambda e: e["date"])[-keep:]
+
+
 def extract_stats_cache():
     """Peak usage, model timeline, per-model token breakdown from stats-cache.json."""
     data = safe_json_load(CLAUDE_DIR / "stats-cache.json")
@@ -1552,6 +1586,7 @@ def extract_stats_cache():
 
     daily = data.get("dailyActivity", [])
     model_usage = data.get("modelUsage", {})
+    daily_activity = _build_daily_activity(daily, data.get("dailyModelTokens", []))
 
     # Peak day
     peak_day = max(daily, key=lambda d: d.get("messageCount", 0)) if daily else {}
@@ -1608,6 +1643,7 @@ def extract_stats_cache():
         "total_sessions_all_time": total_sessions_cache,
         "avg_daily_messages": avg_daily,
         "days_tracked": len(daily),
+        "daily_activity": daily_activity,
         "model_tokens": model_tokens,
         "cache_read_ratio": cache_ratio,
         "lifetime_tokens": lifetime_tokens_inout,
@@ -2845,6 +2881,7 @@ def generate_html(data):
         "skillVersion": VERSION,
         "enhancedStats": _enhanced_stats,
         "perModelTokens": stats_cache.get("model_tokens", {}),
+        "dailyActivity": stats_cache.get("daily_activity", []),
     }
 
     # Global showcase budget — enforced ONCE here at assembly time, not in
