@@ -1025,6 +1025,12 @@ def extract_jsonl_metadata(cutoff):
     task_updates = 0
     plan_mode_enters = 0
 
+    # Wall-clock session-duration fallback. Populated from per-session first/
+    # last JSONL `timestamp` and consumed only when usage-data/session-meta is
+    # absent (see _ts_span_minutes). Capped per session like the meta path.
+    jsonl_total_duration_min = 0.0
+    jsonl_sessions_with_duration = 0
+
     # Git
     branch_prefixes = Counter()
 
@@ -1059,6 +1065,8 @@ def extract_jsonl_metadata(cutoff):
             session_phases_seen = []  # ordered list of phases for this session
             session_skills_seen = []  # ordered skill invocations for this session
             session_entrypoint_counts = Counter()  # entrypoint tally for THIS file
+            session_first_ts = ""  # earliest JSONL timestamp seen this session
+            session_last_ts = ""  # latest JSONL timestamp seen this session
 
             try:
                 with open(jsonl_file, "r", errors="replace") as f:
@@ -1230,12 +1238,31 @@ def extract_jsonl_metadata(cutoff):
                         ver = d.get("version", "")
                         if ver:
                             versions[ver] += 1
+                        # PRIVACY: `timestamp` is a non-PII ISO-8601 UTC time
+                        # (no identity). Read only to derive wall-clock session
+                        # duration. Lexical min/max is valid for fixed-width UTC
+                        # timestamps with a trailing 'Z'.
+                        ts = d.get("timestamp", "")
+                        if ts and ts.endswith("Z") and _TS_ISO_UTC.match(ts):
+                            if not session_first_ts or ts < session_first_ts:
+                                session_first_ts = ts
+                            if ts > session_last_ts:
+                                session_last_ts = ts
 
             except IOError:
                 continue
 
             if session_had_data:
                 session_count += 1
+                if (
+                    session_first_ts
+                    and session_last_ts
+                    and session_last_ts != session_first_ts
+                ):
+                    span_min = _ts_span_minutes(session_first_ts, session_last_ts)
+                    if span_min > 0:
+                        jsonl_total_duration_min += min(span_min, MAX_SESSION_MINUTES)
+                        jsonl_sessions_with_duration += 1
             # Attribute the whole session to its dominant entrypoint so the
             # aggregate reads like "27 cli sessions, 2 sdk-cli" rather than
             # raw per-line counts (which over-weight long sessions).
@@ -1300,6 +1327,10 @@ def extract_jsonl_metadata(cutoff):
         "total_throughput_tokens": (total_input_tokens_jsonl + total_output_tokens_jsonl + total_cache_read_tokens_jsonl + total_cache_create_tokens_jsonl),
         "sessions_scanned": total_sessions_scanned,
         "sessions_with_data": session_count,
+        # Wall-clock duration fallback (JSONL timestamps; see _ts_span_minutes).
+        # Consumed only when the session-meta path reports 0 duration.
+        "total_duration_minutes_jsonl": round(jsonl_total_duration_min, 1),
+        "sessions_with_duration_jsonl": jsonl_sessions_with_duration,
         # Agent patterns
         "agent_count": agent_count,
         "agent_types": dict(agent_types.most_common(10)),
@@ -1865,6 +1896,30 @@ def extract_permission_accumulation():
 
 MAX_SESSION_MINUTES = 480
 
+# Fixed-width UTC timestamp shape (``YYYY-MM-DDTHH:MM:SS...Z``). Gates which
+# JSONL ``timestamp`` values may set the per-session min/max, so a malformed or
+# offset-format value can't be selected as a bound and silently zero a
+# session's span. A string matching this prefix that also ends in ``Z`` parses
+# cleanly via ``datetime.fromisoformat`` after the Z→+00:00 swap.
+_TS_ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _ts_span_minutes(first_iso, last_iso):
+    """Wall-clock minutes between two ISO-8601 timestamps; 0.0 on parse failure.
+
+    Fallback session-duration source for machines where
+    ``~/.claude/usage-data/session-meta/`` is absent — newer Claude Code
+    consolidated that store into ``stats-cache.json``, which carries no
+    per-session duration. Inputs are the first/last JSONL ``timestamp`` seen in
+    a session (fixed-width UTC with a trailing ``Z``)."""
+    try:
+        a = datetime.fromisoformat(first_iso.replace("Z", "+00:00"))
+        b = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+    minutes = (b - a).total_seconds() / 60.0
+    return minutes if minutes > 0 else 0.0
+
 def aggregate_session_meta(sessions):
     if not sessions:
         return {}
@@ -2349,6 +2404,21 @@ def generate_html(data):
     lifetime_tokens = stats_cache.get("lifetime_tokens", 0)
     total_hours = meta.get("total_duration_hours", 0)
     avg_duration = meta.get("avg_duration_minutes", 0)
+    # Fallback when ~/.claude/usage-data/session-meta/ is absent: that store is
+    # the only source of per-session duration, and newer Claude Code no longer
+    # writes it (consolidated into stats-cache.json, which has no duration). To
+    # avoid shipping a misleading "0h", reconstruct wall-clock duration from
+    # per-session JSONL timestamps. See the scan's *_jsonl fields.
+    if not total_hours:
+        _dur_min_jsonl = jsonl.get("total_duration_minutes_jsonl", 0)
+        _dur_sessions_jsonl = jsonl.get("sessions_with_duration_jsonl", 0)
+        if _dur_min_jsonl > 0:
+            total_hours = round(_dur_min_jsonl / 60, 1)
+            avg_duration = (
+                round(_dur_min_jsonl / _dur_sessions_jsonl, 1)
+                if _dur_sessions_jsonl
+                else 0
+            )
 
     tool_counts = Counter(jsonl.get("tool_usage", {}))
     for t, c in meta.get("tool_counts", {}).items():
