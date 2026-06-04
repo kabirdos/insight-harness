@@ -122,6 +122,25 @@ class SelfContainedTokenTests(unittest.TestCase):
             # Resolved exactly once, against the Codex config path only.
             self.assertEqual(seen_paths, [cfg])
 
+    def test_publish_never_falls_back_to_a_valid_claude_token(self):
+        """Behavioral guard (stronger than the spy above): even with a VALID
+        token sitting at the Claude default config path, Codex --publish with no
+        Codex token must still exit 2. A regression that read the Claude path —
+        by any route, not just load_token_from_config(config_path=...) — would
+        find this token, proceed past the exit-2, and fail this test."""
+        with TemporaryDirectory() as d:
+            codex_cfg = Path(d) / "codex" / "insight-harness" / "config.json"  # absent
+            claude_cfg = Path(d) / "claude" / "insight-harness" / "config.json"
+            # Plant a valid token at the Claude default location.
+            codex_extract.save_token_to_config(VALID_TOKEN, config_path=claude_cfg)
+            buf_err = io.StringIO()
+            with patch.object(codex_extract, "CODEX_PUBLISH_CONFIG_PATH", codex_cfg), \
+                 patch.object(extract, "PUBLISH_CONFIG_PATH", claude_cfg), \
+                 patch.object(sys, "stderr", buf_err):
+                rc = codex_extract.main(["--publish"])
+            self.assertEqual(rc, 2)
+            self.assertIn("No token configured", buf_err.getvalue())
+
 
 class PublishDispatchWiringTests(unittest.TestCase):
     """main() threads --confirm and the Codex report_path into publish_report

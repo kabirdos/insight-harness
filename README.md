@@ -39,10 +39,10 @@ One Python script and an HTML template. No npm installs, no pip installs, no nat
 - `~/.claude/projects/*/*.jsonl` — **field-whitelisted**: only tool names, skill names, hook events, tool-transition sequences, and workflow-phase classifications. Never tool arguments, message text, tool results, or project file paths.
 - Per shareable skill: `README.md` and `assets/hero.{png,jpg}` (see scrubbing below).
 
-🚫 **Doesn't do:**
+🚫 **Doesn't do (unless you opt in with `--publish`):**
 
-- **No network calls** from the script itself. `urllib` is imported but never invoked; the only outbound traffic is the optional `gh` call above.
-- **No uploads.** Output is written locally to `~/.claude/insight-harness/report.html`. You choose whether to share it at [insightharness.com](https://insightharness.com).
+- **No network calls by default.** Without `--publish`, the script makes no outbound requests except the optional `gh` call above. `--publish` is the one exception: it POSTs the generated report to insightharness.com using a token you supply.
+- **No uploads by default.** Output is written locally to `~/.claude/insight-harness/report.html` (Codex: `~/.codex/usage-data/`). You choose whether to share it — manually at [insightharness.com](https://insightharness.com), or directly with `--publish`.
 - **No telemetry, analytics, cookies, or service workers.** The HTML is a single static file with inlined images — open it offline, email it, host it yourself.
 
 🛡️ **PII scrubbing before anything ships:** git name/email, OS username paths (`/Users/<you>`, `/home/<you>`), GitHub URLs with your username, and `@<you>` mentions are redacted. Hero images are text-scrubbed only — pixels are out of scope, so review screenshots before uploading. SVG heroes are rejected outright.
