@@ -1588,6 +1588,60 @@ def _build_daily_activity(daily, daily_model_tokens, keep=35):
     return sorted(out, key=lambda e: e["date"])[-keep:]
 
 
+_TEMPORAL_LABELS = {
+    "night": "Night owl",
+    "morning": "Early riser",
+    "afternoon": "Afternoon peak",
+    "evening": "Evening shift",
+}
+
+
+def _compute_temporal(hour_counts):
+    """Characterize *when* work happens from an hour-of-day → count map.
+
+    Returns ``{hourCounts, peakHour, label}`` or ``{}`` when there's no usable
+    data. The label names the dominant quarter of the day (night 0–5, morning
+    6–11, afternoon 12–17, evening 18–23); a meaningful late-night tail
+    (22:00–05:59 ≥ 20% of activity) appends a "burns the midnight oil" note —
+    except when the day is already night-dominant, where the "Night owl" label
+    conveys it and the overlay would be redundant. Each value is a small
+    non-PII aggregate (counts by clock hour)."""
+    if not isinstance(hour_counts, dict):
+        return {}
+    counts = {}
+    for key, value in hour_counts.items():
+        try:
+            hour = int(key)
+        except (ValueError, TypeError):
+            continue
+        if 0 <= hour <= 23 and isinstance(value, (int, float)) and value > 0:
+            counts[hour] = counts.get(hour, 0) + value
+    total = sum(counts.values())
+    if total == 0:
+        return {}
+    peak_hour = max(counts, key=counts.get)
+    buckets = {"night": 0, "morning": 0, "afternoon": 0, "evening": 0}
+    for hour, value in counts.items():
+        if hour <= 5:
+            buckets["night"] += value
+        elif hour <= 11:
+            buckets["morning"] += value
+        elif hour <= 17:
+            buckets["afternoon"] += value
+        else:
+            buckets["evening"] += value
+    dominant = max(buckets, key=buckets.get)
+    label = _TEMPORAL_LABELS[dominant]
+    late = sum(v for h, v in counts.items() if h >= 22 or h <= 5)
+    if dominant != "night" and late / total >= 0.2:
+        label += " · burns the midnight oil"
+    return {
+        "hourCounts": {str(h): counts[h] for h in sorted(counts)},
+        "peakHour": peak_hour,
+        "label": label,
+    }
+
+
 def extract_stats_cache():
     """Peak usage, model timeline, per-model token breakdown from stats-cache.json."""
     data = safe_json_load(CLAUDE_DIR / "stats-cache.json")
@@ -1597,6 +1651,7 @@ def extract_stats_cache():
     daily = data.get("dailyActivity", [])
     model_usage = data.get("modelUsage", {})
     daily_activity = _build_daily_activity(daily, data.get("dailyModelTokens", []))
+    temporal = _compute_temporal(data.get("hourCounts", {}))
 
     # Peak day
     peak_day = max(daily, key=lambda d: d.get("messageCount", 0)) if daily else {}
@@ -1654,6 +1709,7 @@ def extract_stats_cache():
         "avg_daily_messages": avg_daily,
         "days_tracked": len(daily),
         "daily_activity": daily_activity,
+        "temporal": temporal,
         "model_tokens": model_tokens,
         "cache_read_ratio": cache_ratio,
         "lifetime_tokens": lifetime_tokens_inout,
@@ -2950,6 +3006,7 @@ def generate_html(data):
         "enhancedStats": _enhanced_stats,
         "perModelTokens": stats_cache.get("model_tokens", {}),
         "dailyActivity": stats_cache.get("daily_activity", []),
+        "temporal": stats_cache.get("temporal", {}),
         "concurrency": jsonl.get(
             "concurrency",
             {"maxConcurrent": 0, "medianConcurrent": 0, "sessionsCounted": 0},
