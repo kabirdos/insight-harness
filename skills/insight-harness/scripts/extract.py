@@ -1030,6 +1030,9 @@ def extract_jsonl_metadata(cutoff):
     # absent (see _ts_span_minutes). Capped per session like the meta path.
     jsonl_total_duration_min = 0.0
     jsonl_sessions_with_duration = 0
+    # (start, end) ISO timestamps for each session with a valid span; fed to
+    # the concurrency sweep ("runs N sessions in parallel").
+    session_intervals = []
 
     # Git
     branch_prefixes = Counter()
@@ -1263,6 +1266,9 @@ def extract_jsonl_metadata(cutoff):
                     if span_min > 0:
                         jsonl_total_duration_min += min(span_min, MAX_SESSION_MINUTES)
                         jsonl_sessions_with_duration += 1
+                        session_intervals.append(
+                            (session_first_ts, session_last_ts)
+                        )
             # Attribute the whole session to its dominant entrypoint so the
             # aggregate reads like "27 cli sessions, 2 sdk-cli" rather than
             # raw per-line counts (which over-weight long sessions).
@@ -1278,6 +1284,9 @@ def extract_jsonl_metadata(cutoff):
                     if s != deduped[-1]:
                         deduped.append(s)
                 session_skill_sequences.append(deduped)
+
+    # Session concurrency ("runs N sessions in parallel") from per-session spans.
+    concurrency = _compute_concurrency(session_intervals)
 
     # Phase statistics
     total_phase_calls = sum(phase_call_counts.values()) or 1
@@ -1331,6 +1340,7 @@ def extract_jsonl_metadata(cutoff):
         # Consumed only when the session-meta path reports 0 duration.
         "total_duration_minutes_jsonl": round(jsonl_total_duration_min, 1),
         "sessions_with_duration_jsonl": jsonl_sessions_with_duration,
+        "concurrency": concurrency,
         # Agent patterns
         "agent_count": agent_count,
         "agent_types": dict(agent_types.most_common(10)),
@@ -1938,6 +1948,64 @@ MAX_SESSION_MINUTES = 480
 # session's span. A string matching this prefix that also ends in ``Z`` parses
 # cleanly via ``datetime.fromisoformat`` after the Z→+00:00 swap.
 _TS_ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _parse_iso(value):
+    """Parse an ISO-8601 timestamp to a timezone-aware datetime, or None.
+
+    Naive values (no tzinfo) are rejected so callers can sort/compare results
+    without risking a naive-vs-aware ``TypeError`` on mixed input. Production
+    timestamps are fixed UTC ``Z``; this just keeps the helper total."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _compute_concurrency(intervals):
+    """Session concurrency from ``[(start_iso, end_iso), ...]`` via a sweep line.
+
+    Returns ``{maxConcurrent, medianConcurrent, sessionsCounted}``:
+
+    - ``maxConcurrent`` — peak sessions open at the same instant ("runs N in
+      parallel" headline).
+    - ``medianConcurrent`` — median parallelism observed at session starts (a
+      "typical" level, robust to a few long-running outliers).
+    - ``sessionsCounted`` — sessions with a usable span that fed the sweep.
+
+    Ends sort before starts at an equal instant, so a session that ends exactly
+    as the next begins is not counted as overlapping. Unparseable or
+    non-positive intervals are skipped."""
+    events = []  # (datetime, kind); kind 0=end, 1=start so ends sort first
+    for start_iso, end_iso in intervals:
+        start = _parse_iso(start_iso)
+        end = _parse_iso(end_iso)
+        if start is None or end is None or end <= start:
+            continue
+        events.append((start, 1))
+        events.append((end, 0))
+    if not events:
+        return {"maxConcurrent": 0, "medianConcurrent": 0, "sessionsCounted": 0}
+    events.sort(key=lambda ev: (ev[0], ev[1]))
+    current = 0
+    max_concurrent = 0
+    at_start = []
+    for _, kind in events:
+        if kind == 1:
+            current += 1
+            at_start.append(current)
+            if current > max_concurrent:
+                max_concurrent = current
+        else:
+            current -= 1
+    at_start.sort()
+    median = at_start[len(at_start) // 2] if at_start else 0
+    return {
+        "maxConcurrent": max_concurrent,
+        "medianConcurrent": median,
+        "sessionsCounted": len(at_start),
+    }
 
 
 def _ts_span_minutes(first_iso, last_iso):
@@ -2882,6 +2950,10 @@ def generate_html(data):
         "enhancedStats": _enhanced_stats,
         "perModelTokens": stats_cache.get("model_tokens", {}),
         "dailyActivity": stats_cache.get("daily_activity", []),
+        "concurrency": jsonl.get(
+            "concurrency",
+            {"maxConcurrent": 0, "medianConcurrent": 0, "sessionsCounted": 0},
+        ),
     }
 
     # Global showcase budget — enforced ONCE here at assembly time, not in
