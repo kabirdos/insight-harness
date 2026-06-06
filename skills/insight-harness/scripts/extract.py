@@ -2524,6 +2524,75 @@ def _render_insights_tab(insights_report):
 </div>'''
 
 
+def _build_stat_cells(
+    *,
+    sessions,
+    tokens,
+    lifetime_tokens,
+    duration_hours,
+    avg_minutes,
+    skills_used,
+    hooks,
+    commit_count,
+    pr_count,
+    fmt,
+):
+    """Build the standalone-HTML stat-grid cells, omitting any metric whose
+    source is genuinely empty rather than rendering a misleading "0".
+
+    A confident ``0h`` / ``0 commits`` reads as a *false claim* (instant
+    sessions, no work) and undercuts the product's load-bearing "verified,
+    honest data" promise — the worst failure mode (issue #29). Sessions, tokens,
+    skills, hooks, and PRs always have a live source (JSONL scan), so they
+    render unconditionally. Lifetime-tokens (stats-cache) and duration/avg-
+    session (session-meta or the JSONL wall-clock fallback) can be sourceless on
+    modern machines, so they appear only when truthy.
+
+    ``commit_count`` distinguishes *sourceless* from *sourced-zero*: pass
+    ``None`` when there is no commit source (the legacy session-meta dir is
+    absent), and an int — including a genuine ``0`` — when the source exists.
+    A sourced ``0`` is honest data and still renders; only ``None`` is dropped.
+    """
+
+    def cell(value, label):
+        return (
+            f'<div class="stat"><div class="stat-value">{value}</div>'
+            f'<div class="stat-label">{label}</div></div>'
+        )
+
+    cells = [cell(sessions, "Sessions"), cell(fmt(tokens), "Tokens")]
+    if lifetime_tokens:
+        cells.append(cell(fmt(lifetime_tokens), "Lifetime Tokens"))
+    if duration_hours:
+        cells.append(cell(f"{duration_hours}h", "Duration"))
+    if avg_minutes and round(avg_minutes) >= 1:
+        cells.append(cell(f"{avg_minutes:.0f}m", "Avg Session"))
+    cells.append(cell(skills_used, "Skills Used"))
+    cells.append(cell(hooks, "Hooks"))
+    if commit_count is not None:
+        cells.append(cell(commit_count, "Commits"))
+    cells.append(cell(pr_count, "PRs"))
+    return cells
+
+
+def _build_git_meta_line(*, pr_count, commit_count, lines_added, fmt):
+    """Build the Git Patterns meta line. PRs always render (live JSONL
+    ``pr-link`` source). ``commit_count`` / ``lines_added`` are ``None`` when
+    sourceless (no session-meta) and an int — including a genuine ``0`` — when
+    the source exists, so a sourceless machine never ships "0 commits &middot;
+    0 lines added" while an honest sourced zero still shows (issue #29)."""
+    parts = [f'<strong style="color:var(--ink)">{pr_count}</strong> PRs']
+    if commit_count is not None:
+        parts.append(
+            f'<strong style="color:var(--ink)">{commit_count}</strong> commits'
+        )
+    if lines_added is not None:
+        parts.append(
+            f'<strong style="color:var(--ink)">{fmt(lines_added)}</strong> lines added'
+        )
+    return " &middot; ".join(parts)
+
+
 def generate_html(data):
     now = datetime.now()
     period_start = now - timedelta(days=DAYS)
@@ -3023,6 +3092,37 @@ def generate_html(data):
     # Mandatory: escape </script> to prevent breaking the script tag
     _harness_json_str = _harness_json_str.replace("</script>", r"<\/script>")
 
+    # Stats grid + Git meta line — omit any metric whose source is genuinely
+    # empty rather than shipping a misleading "0h"/"0" (issue #29). See the
+    # _build_stat_cells / _build_git_meta_line helpers for the per-metric rule.
+    # commits/lines: no default, so meta.get() yields None when session-meta is
+    # absent (sourceless → omit) and an int — incl. a real 0 — when it exists
+    # (sourced zero → still render). aggregate_session_meta() returns {} with no
+    # keys when there are no sessions, and both keys otherwise.
+    _pr_count = jsonl.get("pr_count", 0)
+    _commit_count = meta.get("total_git_commits")
+    _lines_added = meta.get("total_lines_added")
+    stats_grid_cells = "\n    ".join(
+        _build_stat_cells(
+            sessions=total_sessions,
+            tokens=total_tokens,
+            lifetime_tokens=lifetime_tokens,
+            duration_hours=total_hours,
+            avg_minutes=avg_duration,
+            skills_used=len(skill_invocations),
+            hooks=len(hook_defs),
+            commit_count=_commit_count,
+            pr_count=_pr_count,
+            fmt=fmt,
+        )
+    )
+    git_meta_line = _build_git_meta_line(
+        pr_count=_pr_count,
+        commit_count=_commit_count,
+        lines_added=_lines_added,
+        fmt=fmt,
+    )
+
     html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3149,15 +3249,7 @@ h3 {{ font-size:0.8rem; font-weight:600; color:var(--ink); margin:1rem 0 0.5rem;
 </header>
 
 <div class="stats-grid">
-    <div class="stat"><div class="stat-value">{total_sessions}</div><div class="stat-label">Sessions</div></div>
-    <div class="stat"><div class="stat-value">{fmt(total_tokens)}</div><div class="stat-label">Tokens</div></div>
-    <div class="stat"><div class="stat-value">{fmt(lifetime_tokens)}</div><div class="stat-label">Lifetime Tokens</div></div>
-    <div class="stat"><div class="stat-value">{total_hours}h</div><div class="stat-label">Duration</div></div>
-    <div class="stat"><div class="stat-value">{avg_duration:.0f}m</div><div class="stat-label">Avg Session</div></div>
-    <div class="stat"><div class="stat-value">{len(skill_invocations)}</div><div class="stat-label">Skills Used</div></div>
-    <div class="stat"><div class="stat-value">{len(hook_defs)}</div><div class="stat-label">Hooks</div></div>
-    <div class="stat"><div class="stat-value">{meta.get("total_git_commits", 0)}</div><div class="stat-label">Commits</div></div>
-    <div class="stat"><div class="stat-value">{jsonl.get("pr_count", 0)}</div><div class="stat-label">PRs</div></div>
+    {stats_grid_cells}
 </div>
 
 <!-- Autonomy Style -->
@@ -3353,7 +3445,7 @@ f'<div class="meta" style="margin-top:0.5rem">{jsonl.get("agent_background_pct",
 <section>
     <div class="section-header"><h2>Git Patterns</h2></div>
     <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:0.8rem">
-        <div class="meta"><strong style="color:var(--ink)">{jsonl.get("pr_count",0)}</strong> PRs &middot; <strong style="color:var(--ink)">{meta.get("total_git_commits",0)}</strong> commits &middot; <strong style="color:var(--ink)">{fmt(meta.get("total_lines_added",0))}</strong> lines added</div>
+        <div class="meta">{git_meta_line}</div>
     </div>
     <h3>Branch Conventions</h3>
     <div class="tags">{branch_items or '<span class="empty">No data</span>'}</div>
